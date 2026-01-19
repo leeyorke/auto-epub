@@ -1,0 +1,22 @@
+{
+    // 指定使用Pylance作为Python语言服务器
+    "python.languageServer": "Pylance",
+    // 启用自动导入补全功能，当编写代码时，Pylance会自动建议导入缺失的模块
+    "python.analysis.autoImportCompletions": true,
+    // 设置类型检查模式为"basic" [basic/standard/strict][基础/标准/严格]
+    "python.analysis.typeCheckingMode": "basic",
+
+    // 仅对Python文件生效
+    "[python]": {
+      // 代码保存时进行格式化
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        // 在保存时应用所有可用的代码修复（包括格式化、导入排序等）
+        "source.fixAll": "explicit",
+        // 在保存时自动组织导入语句（排序和分组导入）
+        "source.organizeImports": "explicit"
+      },
+      // 默认格式化器为ruff，需要pip安装ruff、vscode插件安装ruff。Ruff是一个快速的Python代码格式化工具，比Black和YAPF更快
+      "editor.defaultFormatter": "charliermarsh.ruff"
+    }
+}
