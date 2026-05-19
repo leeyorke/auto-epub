@@ -5,12 +5,13 @@ EPUB 翻译器 - 使用 Agent + Toolsets 方式
 from pathlib import Path
 
 from ebooklib import epub
-from pydantic_ai import Agent
+from pydantic_ai import Agent, UsageLimits
 
 from .agent_tools import EpubContext
 from .cache_manager import CacheManager
 from .epub_tools import EpubTools
 from .models import TranslationProgress
+from .settings import MAX_REQUESTS
 
 
 class EpubTranslator:
@@ -107,7 +108,9 @@ class EpubTranslator:
         print("\n🤖 启动智能翻译 Agent...\n")
 
         # 7. 让 Agent 执行翻译
-        result = await self.agent.run(task_prompt, deps=ctx)  # type: ignore
+        result = await self.agent.run(
+            task_prompt, deps=ctx, usage_limits=UsageLimits(request_limit=MAX_REQUESTS)
+        )  # type: ignore
 
         print("\n✅ 翻译完成！")
         print(f"📄 输出文件: {output_file}")
@@ -143,7 +146,8 @@ class EpubTranslator:
    - 使用 get_chapter_content 获取章节内容
    - 翻译 HTML 内容中的文本，保留所有 HTML 标签
    - 识别并记录专有名词（人名、地名等）到术语表
-   - 使用 save_translated_chapter 保存翻译结果
+   - 使用 store_translation_chunk 分次写入翻译结果（大章节可分多次调用）
+   - 使用 save_translated_chapter 最终保存章节
    - 发现新术语时使用 update_glossary 更新术语表
 
    **翻译规则：**
@@ -152,6 +156,8 @@ class EpubTranslator:
    - 后续出现保持一致性，使用术语表
    - 保持文学风格和语气
    - 段落结构不变
+
+   保存章节请注意：改用两步法——先用 store_translation_chunk 写入（支持多次分块），最后调用 save_translated_chapter(chapter_index) 保存。save_translated_chapter 不再接受 translated_html 参数。
 
 3. **检查进度**
    - 每翻译完一个章节就使用 get_translation_progress 查看下进度

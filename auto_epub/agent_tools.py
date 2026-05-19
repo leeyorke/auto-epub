@@ -34,6 +34,8 @@ class EpubContext:
         self.source_language = EpubTools.get_default_language(book)
         self.chapters = EpubTools.get_all_chapters(book)
         self.images = EpubTools.get_all_images(book)
+        # 翻译内容缓冲区：模型可以分多次写入，避免单次工具调用参数过大
+        self.translation_buffer: Dict[int, str] = {}
 
 
 # 创建工具集
@@ -159,7 +161,8 @@ def translate_chapter_content(ctx: RunContext[EpubContext], html_content: str) -
         translated_chunks = []
 
         for chunk in chunks:
-            # TODO: 明天需要检查这里的代码
+            # TODO: 明天需要检查这里的代码，需要测试下效果，看是否真的根据分块
+            # TODO: 提示去翻译了，如果没有分块翻译，那么需要在提示词中提示一下
             # 这里实际上应该调用 LLM，但在 tool 中我们返回指示
             # Agent 会接收到这个内容，然后自己翻译
             translated_chunks.append(f"[需要翻译的内容块]\n{chunk}")
@@ -172,15 +175,42 @@ def translate_chapter_content(ctx: RunContext[EpubContext], html_content: str) -
 
 
 @epub_toolset.tool
-def save_translated_chapter(
+def store_translation_chunk(
     ctx: RunContext[EpubContext], chapter_index: int, translated_html: str
 ) -> str:
     """
-    保存翻译后的章节
+    存储章节翻译内容片段
+
+    用于分块保存大章节的翻译内容。可以多次调用此工具写入同一章节的不同片段，
+    全部写入完成后调用 save_translated_chapter 一次性保存。
 
     Args:
         chapter_index: 章节索引（从 1 开始）
-        translated_html: 翻译后的完整 HTML 内容
+        translated_html: 翻译后的 HTML 内容片段
+
+    Returns:
+        存储结果消息
+    """
+    if chapter_index < 1 or chapter_index > len(ctx.deps.chapters):
+        return f"错误：章节索引 {chapter_index} 超出范围"
+
+    prev = ctx.deps.translation_buffer.get(chapter_index, "")
+    ctx.deps.translation_buffer[chapter_index] = prev + translated_html
+
+    total = len(ctx.deps.translation_buffer[chapter_index])
+    return f"✓ 已存储章节 {chapter_index} 的翻译片段（累计 {total} 字符）"
+
+
+@epub_toolset.tool
+def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) -> str:
+    """
+    保存翻译后的章节
+
+    从翻译缓冲区中取出之前通过 store_translation_chunk 存入的内容，保存到 EPUB。
+    调用前需确保已通过 store_translation_chunk 写入翻译内容。
+
+    Args:
+        chapter_index: 章节索引（从 1 开始）
 
     Returns:
         保存结果消息
@@ -194,6 +224,11 @@ def save_translated_chapter(
 
     if not chapter_id:
         return "错误：章节id获取为空"
+
+    # 从缓冲区取翻译内容
+    translated_html = ctx.deps.translation_buffer.pop(chapter_index, "")
+    if not translated_html:
+        return "错误：未找到翻译内容，请先调用 store_translation_chunk 写入翻译"
 
     # 更新章节内容
     chapter.set_content(translated_html.encode("utf-8"))

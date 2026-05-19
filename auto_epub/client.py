@@ -30,7 +30,12 @@ def create_epub_agent(target_language: str) -> Agent[EpubContext, str]:
         provider=OpenAIProvider(
             base_url=model_provider.base_url, api_key=model_provider.api_key
         ),
-        settings=ModelSettings(temperature=TEMPERATURE, max_tokens=OUTPUT_MAX_TOKENS),
+        settings=ModelSettings(
+            temperature=TEMPERATURE,
+            max_tokens=OUTPUT_MAX_TOKENS,
+            # deepseek需要关闭思考模式，如启用，需要回传content
+            extra_body={"thinking": {"type": "disabled"}},
+        ),
     )
 
     return Agent(
