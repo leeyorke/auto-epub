@@ -3,16 +3,16 @@ EPUB 翻译工具集 - 使用 Toolsets 方式
 """
 
 import base64
+from queue import Queue
 from typing import Dict, List, Optional
 
-from bs4 import BeautifulSoup
 from ebooklib import epub
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 from .cache_manager import CacheManager
 from .epub_tools import EpubTools
-from .settings import INPUT_MAX_TOKENS, TRANSLATE_IMAGES
+from .settings import TRANSLATE_IMAGES
 
 
 class EpubContext:
@@ -36,6 +36,8 @@ class EpubContext:
         self.images = EpubTools.get_all_images(book)
         # 翻译内容缓冲区：模型可以分多次写入，避免单次工具调用参数过大
         self.translation_buffer: Dict[int, str] = {}
+        # 待翻译章节内容缓冲队列：模型可以分多次写入，避免单次工具调用参数过大
+        self.untranslated_buffer: Queue[str] = Queue()
 
 
 # 创建工具集
@@ -99,79 +101,80 @@ def list_chapters(ctx: RunContext[EpubContext]) -> str:
 
 
 @epub_toolset.tool
-def get_chapter_content(ctx: RunContext[EpubContext], chapter_index: int) -> str:
+def store_chapter_chunk(ctx: RunContext[EpubContext], chapter_index: int) -> str:
     """
-    获取指定章节的内容
+    切分并缓存指定章节的内容
 
     Args:
         chapter_index: 章节索引（从 1 开始）
 
     Returns:
-        章节的 HTML 内容d
+        章节的 HTML 内容
     """
-    print(f"正在读取章节[{chapter_index}]内容...")
-    if chapter_index < 1 or chapter_index > len(ctx.deps.chapters):
-        return f"错误：章节索引 {chapter_index} 超出范围（1-{len(ctx.deps.chapters)}）"
+    chapters = ctx.deps.chapters
+    chapters_total = len(chapters)
+    if chapter_index < 1 or chapter_index > chapters_total:
+        return f"错误：章节索引 {chapter_index} 超出范围（1-{chapters_total}）"
 
-    chapter = ctx.deps.chapters[chapter_index - 1]
+    chapter = chapters[chapter_index - 1]
     data = chapter.get_content()
     if not data:
-        return ""
+        return "获取章节内容为空"
 
     try:
         content = data.decode("utf-8", errors="ignore")
     except Exception as e:
         print(f"❌ 错误 - {type(e).__name__}")
-        return ""
+        return f"已切分并缓存章节{chapter_index}的内容"
 
-    return content
+    # 分块
+    chunks = EpubTools.split_html_content(content)
+
+    for chunk in chunks:
+        ctx.deps.untranslated_buffer.put(chunk)
+
+    return ""
 
 
 @epub_toolset.tool
-def translate_chapter_content(ctx: RunContext[EpubContext], html_content: str) -> str:
+def is_untranslated_buffer_empty(
+    ctx: RunContext[EpubContext], chapter_index: int
+) -> bool:
     """
-    翻译章节的 HTML 内容
+    获取当前缓冲队列状态
 
-    这个工具只翻译 HTML 中的文本内容，保留所有标签和结构
+    为空返回真，否则返回假
+    """
+    if ctx.deps.untranslated_buffer.empty():
+        print(f"章节{chapter_index}的所有内容片段已全部翻译完成")
+        return True
+    return False
+
+
+@epub_toolset.tool
+def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -> str:
+    """
+    获取待翻译的 HTML 内容
+
+    从待翻译缓冲队列中取出html内容进行翻译。
+    可以多次调用此工具获取同一章节的不同待翻译片段。
 
     Args:
-        html_content: 要翻译的 HTML 内容
+        chapter_index: 章节索引（从 1 开始）
 
     Returns:
-        翻译后的 HTML 内容
+        这里返回待翻译的 HTML 内容块（实际的翻译由 Agent 自己完成）
     """
-    print("正在翻译章节...")
-    # 解析 HTML
-    soup = BeautifulSoup(html_content, "html.parser")
-    body = soup.find("body")
+    print(f"正在翻译章节{chapter_index}...")
 
-    if not body:
-        # 如果没有 body 标签，直接返回
-        return html_content
+    if ctx.deps.untranslated_buffer.empty():
+        print(f"章节{chapter_index}的所有内容片段已全部翻译完成")
+        return ""
 
-    # 提取 body 内容
-    body_content = "".join(str(child) for child in body.children)
+    untranslated_buffer = ctx.deps.untranslated_buffer.get()
 
-    # 检查是否需要分块
-    token_count = EpubTools.count_tokens(body_content)
-
-    if token_count > INPUT_MAX_TOKENS:
-        # 分块翻译
-        chunks = EpubTools.split_html_content(body_content)
-        translated_chunks = []
-
-        for chunk in chunks:
-            # TODO: 明天需要检查这里的代码，需要测试下效果，看是否真的根据分块
-            # TODO: 提示去翻译了，如果没有分块翻译，那么需要在提示词中提示一下
-            # 这里实际上应该调用 LLM，但在 tool 中我们返回指示
-            # Agent 会接收到这个内容，然后自己翻译
-            translated_chunks.append(f"[需要翻译的内容块]\n{chunk}")
-
-        return "\n\n[分块翻译]\n\n".join(translated_chunks)
-
-    # 返回需要翻译的内容
-    # 实际的翻译由 Agent 自己完成
-    return body_content
+    # 返回待翻译的内容，实际的翻译由 Agent 自己完成
+    return untranslated_buffer
 
 
 @epub_toolset.tool

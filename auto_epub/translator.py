@@ -74,6 +74,7 @@ class EpubTranslator:
 
         # 3. 初始化进度
         chapters = EpubTools.get_all_chapters(book)
+        print(f"\n共{len(chapters)}章...\n")
 
         if not progress:
             progress = TranslationProgress(
@@ -130,43 +131,45 @@ class EpubTranslator:
         task = f"""\
 请完成以下翻译任务：
 
-**翻译目标：**
+## 翻译目标
 - 源语言: {progress.source_lang}
 - 目标语言: {progress.target_lang}
 - 输出文件: {output_file}
 
-**任务流程：**
+## 任务流程
 
-**获取书籍信息**
+### 获取书籍信息
    - 使用 get_book_info 工具查看书籍基本信息
    - 使用 list_chapters 工具查看所有章节
 
-2. **翻译章节**（最重要的任务）
-   对于每个待翻译的章节：
-   - 使用 get_chapter_content 获取章节内容
-   - 翻译 HTML 内容中的文本，保留所有 HTML 标签
-   - 识别并记录专有名词（人名、地名等）到术语表
-   - 使用 store_translation_chunk 分次写入翻译结果（大章节可分多次调用）
-   - 使用 save_translated_chapter 最终保存章节
-   - 发现新术语时使用 update_glossary 更新术语表
+### 翻译章节（严格按照以下步骤进行）
 
-   **翻译规则：**
-   - 只翻译文本内容，完全保留 HTML 标签和属性
-   - 专有名词第一次出现时标注原文，如：于连·索雷尔(Julien Sorel)
-   - 后续出现保持一致性，使用术语表
-   - 保持文学风格和语气
-   - 段落结构不变
+对于每个待翻译的章节：
+   1. 使用 store_chapter_chunk 创建待翻译章节队列
+   2. 使用 get_untranslated_content 获取待翻译内容片段
+   3. 对获取的内容片段进行按照规则进行翻译
+   4. 使用 store_translation_chunk 写入翻译结果（大章节可分多次调用）
+   5. 使用 is_untranslated_buffer_empty 获取当前缓冲队列状态，如果为否，**重复2~5步骤**，否则就按找步骤顺序继续往下执行。
+   6. 使用 save_translated_chapter 最终保存章节
+   7. 发现新术语时使用 update_glossary 更新术语表
+   8. 使用 get_translation_progress 查看进度
 
-   保存章节请注意：改用两步法——先用 store_translation_chunk 写入（支持多次分块），最后调用 save_translated_chapter(chapter_index) 保存。save_translated_chapter 不再接受 translated_html 参数。
 
-3. **检查进度**
+### 保存章节（两步法）
+   1. 用 store_translation_chunk(chapter_index, translated_html) 写入翻译内容
+       - 对内容较多的大章节可以分多次调用，每次传入部分内容
+       - 工具会按章节索引自动拼接所有片段
+   2. 最后用 save_translated_chapter(chapter_index) 一次性保存到 EPUB
+       - 必须确保之前已通过 store_translation_chunk 写入了内容
+
+### 检查进度
    - 每翻译完一个章节就使用 get_translation_progress 查看下进度
    - 确保所有章节都已翻译
 """
 
         if translate_toc:
             task += """
-4. **翻译目录**
+### 翻译目录
    - 使用 translate_toc 获取目录项
    - 翻译所有目录标题（保持与正文术语一致）
    - 使用 save_translated_toc 保存翻译后的目录
@@ -174,7 +177,7 @@ class EpubTranslator:
 
         if translate_images:
             task += """
-5. **翻译图片**
+### 翻译图片
    - 使用 list_images 查看所有图片
    - 对于有文字的图片：
      * 使用 get_image_base64 获取图片
@@ -185,15 +188,22 @@ class EpubTranslator:
 
         task += f"""
 
-6. **完成翻译**
-   - 使用 finalize_epub 保存最终的 EPUB 文件到 {output_file}
+### 完成翻译
 
-**当前进度：**
+使用 finalize_epub 保存最终的 EPUB 文件到 {output_file}
+
+在调用 finalize_epub 之前，必须按顺序执行：
+1. 调用 list_chapters 获取总章节数
+2. 调用 get_translation_progress 获取已完成章节数
+3. 只有 已完成章节数 == 总章节数 时，才能调用 finalize_epub
+4. 如果还有待翻译章节，继续翻译，严禁提前结束
+
+### 当前进度
 - 已完成章节: {len(progress.completed_chapters)}
 - 总章节数: {progress.total_chapters}
 - 失败章节: {len(progress.failed_chapters)}
 
-**重要提示：**
+### 重要提示
 - 按顺序逐章翻译，不要遗漏
 - 遇到错误时重试，但不要无限循环
 - 完成后确认所有章节都已翻译

@@ -5,8 +5,8 @@
 # API 设置
 TIMEOUT = 60
 MAX_RETRIES = 10
-OUTPUT_MAX_TOKENS = 65536  # 足够容纳大章节的翻译内容+JSON转义开销
-INPUT_MAX_TOKENS = 6000
+OUTPUT_MAX_TOKENS = 8192  # 足够容纳大章节的翻译内容+JSON转义开销
+INPUT_MAX_TOKENS = 6144
 TEMPERATURE = 0.1
 MAX_REQUESTS = 500  # 单次 Agent run 最大 API 请求数（32章约需200-300次）
 
@@ -48,21 +48,6 @@ AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手，专门负�
    - 定期保存进度
    - 遇到错误时重试
    - 完成后确认所有章节都已翻译
-
-**工具使用建议：**
-- 开始前先用 get_book_info 和 list_chapters 了解书籍结构
-- 翻译时用 get_glossary 查看已有术语
-- 发现新术语立即用 update_glossary 记录
-- 每翻译一个章节就用 get_translation_progress 检查进度
-- 完成后必须用 finalize_epub 保存文件
-
-**保存章节（两步法）：**
-1. 用 store_translation_chunk(chapter_index, translated_html) 写入翻译内容
-   - 对内容较多的大章节可以分多次调用，每次传入部分内容
-   - 工具会按章节索引自动拼接所有片段
-2. 最后用 save_translated_chapter(chapter_index) 一次性保存到 EPUB
-   - 此工具不再接受 translated_html 参数
-   - 必须确保之前已通过 store_translation_chunk 写入了内容
 
 目标语言：{target_language}
 
