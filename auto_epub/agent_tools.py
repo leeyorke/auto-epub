@@ -3,7 +3,7 @@ EPUB 翻译工具集 - 使用 Toolsets 方式
 """
 
 import base64
-from queue import Queue
+import re
 from typing import Dict, List, Optional
 
 from ebooklib import epub
@@ -12,7 +12,55 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from .cache_manager import CacheManager
 from .epub_tools import EpubTools
-from .settings import TRANSLATE_IMAGES
+from .logger import get_logger
+from .settings import MIN_TAG_RATIO, TRANSLATE_IMAGES
+
+_TAG_RE = re.compile(r"<[a-zA-Z/][^>]*>")
+
+
+def collect_toc_titles(toc_items) -> List[str]:
+    """按 book.toc 的递归顺序摊平所有标题。
+
+    与 apply_toc_titles 必须严格同序：一个负责取、一个负责放，
+    顺序不一致会让译文错位到别的条目上。
+    """
+    titles: List[str] = []
+    for item in toc_items:
+        if isinstance(item, epub.Link):
+            titles.append(item.title)
+        elif isinstance(item, tuple):
+            section, children = item
+            if isinstance(section, epub.Link):
+                titles.append(section.title)
+            titles.extend(collect_toc_titles(children))
+    return titles
+
+
+def apply_toc_titles(toc_items, titles_iter):
+    """按顺序把标题写回目录结构，返回重建后的结构"""
+    updated = []
+    for item in toc_items:
+        if isinstance(item, epub.Link):
+            new_title = next(titles_iter, item.title)
+            updated.append(epub.Link(item.href, new_title, item.uid))
+        elif isinstance(item, tuple):
+            section, children = item
+            if isinstance(section, epub.Link):
+                new_title = next(titles_iter, section.title)
+                new_section = epub.Link(section.href, new_title, section.uid)
+            else:
+                new_section = section
+            updated.append((new_section, apply_toc_titles(children, titles_iter)))
+    return updated
+
+
+def _count_tags(html: str) -> int:
+    """统计 HTML 标签数量。
+
+    译文要求原样保留标签，因此标签数是比字符数更可靠的完整性信号：
+    中文译文字符数天然比英文原文少一半左右，用字符数判断会大量误报。
+    """
+    return len(_TAG_RE.findall(html))
 
 
 class EpubContext:
@@ -36,8 +84,63 @@ class EpubContext:
         self.images = EpubTools.get_all_images(book)
         # 翻译内容缓冲区：模型可以分多次写入，避免单次工具调用参数过大
         self.translation_buffer: Dict[int, str] = {}
-        # 待翻译章节内容缓冲队列：模型可以分多次写入，避免单次工具调用参数过大
-        self.untranslated_buffer: Queue[str] = Queue()
+        # 待翻译分块队列，按章节索引隔离，避免多个章节的分块互相串位
+        self.untranslated_buffer: Dict[int, List[str]] = {}
+        # 各章节原文的标签数，用于保存时校验译文是否严重缺失
+        self.source_tags: Dict[int, int] = {}
+        # 各章节 save 被拒次数，避免完整性校验把模型卡死在重试循环里
+        self.save_rejections: Dict[int, int] = {}
+
+    def prepare_chapter(self, chapter_index: int) -> int:
+        """切分章节内容并重置该章状态，返回分块数。
+
+        切分由 Python 在 run 之前完成，不作为 Agent 工具暴露：
+        模型重复调用切分会清空已攒的译文，导致永远保存不了。
+
+        Returns:
+            分块数量；章节内容为空或解码失败时返回 0
+        """
+        self.translation_buffer.pop(chapter_index, None)
+        self.save_rejections.pop(chapter_index, None)
+        self.untranslated_buffer[chapter_index] = []
+        self.source_tags[chapter_index] = 0
+
+        chapter = self.chapters[chapter_index - 1]
+        data = chapter.get_content()
+        if not data:
+            return 0
+
+        try:
+            content = data.decode("utf-8", errors="ignore")
+        except Exception as e:
+            print(f"❌ 章节 {chapter_index} 解码失败 - {type(e).__name__}")
+            get_logger().error(f"章节 {chapter_index} 解码失败: {type(e).__name__}")
+            return 0
+
+        chunks = EpubTools.split_html_content(content)
+        self.untranslated_buffer[chapter_index] = list(chunks)
+        self.source_tags[chapter_index] = sum(_count_tags(c) for c in chunks)
+
+        # 分块尺寸是定位"输出被截断"类失败的关键证据，逐块记录
+        get_logger().chunks(
+            chapter_index,
+            [
+                {
+                    "tokens": EpubTools.count_tokens(c),
+                    "chars": len(c),
+                    "tags": _count_tags(c),
+                }
+                for c in chunks
+            ],
+        )
+        return len(chunks)
+
+    def reset_chapter(self, chapter_index: int) -> None:
+        """清理某章节的所有中间状态（重试该章前调用）"""
+        self.untranslated_buffer.pop(chapter_index, None)
+        self.translation_buffer.pop(chapter_index, None)
+        self.source_tags.pop(chapter_index, None)
+        self.save_rejections.pop(chapter_index, None)
 
 
 # 创建工具集
@@ -101,80 +204,68 @@ def list_chapters(ctx: RunContext[EpubContext]) -> str:
 
 
 @epub_toolset.tool
-def store_chapter_chunk(ctx: RunContext[EpubContext], chapter_index: int) -> str:
+def is_untranslated_buffer_empty(
+    ctx: RunContext[EpubContext], chapter_index: int
+) -> str:
     """
-    切分并缓存指定章节的内容
+    检查指定章节的待翻译分块是否已全部取完
 
     Args:
         chapter_index: 章节索引（从 1 开始）
 
     Returns:
-        章节的 HTML 内容
+        剩余分块情况的描述
     """
-    chapters = ctx.deps.chapters
-    chapters_total = len(chapters)
-    if chapter_index < 1 or chapter_index > chapters_total:
-        return f"错误：章节索引 {chapter_index} 超出范围（1-{chapters_total}）"
-
-    chapter = chapters[chapter_index - 1]
-    data = chapter.get_content()
-    if not data:
-        return "获取章节内容为空"
-
-    try:
-        content = data.decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"❌ 错误 - {type(e).__name__}")
-        return f"已切分并缓存章节{chapter_index}的内容"
-
-    # 分块
-    chunks = EpubTools.split_html_content(content)
-
-    for chunk in chunks:
-        ctx.deps.untranslated_buffer.put(chunk)
-
-    return ""
-
-
-@epub_toolset.tool
-def is_untranslated_buffer_empty(
-    ctx: RunContext[EpubContext], chapter_index: int
-) -> bool:
-    """
-    获取当前缓冲队列状态
-
-    为空返回真，否则返回假
-    """
-    if ctx.deps.untranslated_buffer.empty():
+    remaining = len(ctx.deps.untranslated_buffer.get(chapter_index, []))
+    if remaining == 0:
         print(f"章节{chapter_index}的所有内容片段已全部翻译完成")
-        return True
-    return False
+        return f"✓ 章节 {chapter_index} 的分块已全部取完，可以调用 save_translated_chapter 保存。"
+    return (
+        f"章节 {chapter_index} 还剩 {remaining} 个分块未翻译，"
+        f"请继续调用 get_untranslated_content。"
+    )
 
 
 @epub_toolset.tool
 def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -> str:
     """
-    获取待翻译的 HTML 内容
+    从指定章节的待翻译队列中取出下一个 HTML 分块
 
-    从待翻译缓冲队列中取出html内容进行翻译。
-    可以多次调用此工具获取同一章节的不同待翻译片段。
+    每次调用取出一块，需重复调用直到取完该章节的所有分块。
+    取出的内容由你自己翻译，然后通过 store_translation_chunk 写回。
 
     Args:
         chapter_index: 章节索引（从 1 开始）
 
     Returns:
-        这里返回待翻译的 HTML 内容块（实际的翻译由 Agent 自己完成）
+        待翻译的 HTML 内容块
     """
-    print(f"正在翻译章节{chapter_index}...")
+    if chapter_index not in ctx.deps.untranslated_buffer:
+        return f"错误：章节 {chapter_index} 不在本次任务范围内"
 
-    if ctx.deps.untranslated_buffer.empty():
+    pending = ctx.deps.untranslated_buffer[chapter_index]
+    if not pending:
         print(f"章节{chapter_index}的所有内容片段已全部翻译完成")
-        return ""
+        return (
+            f"章节 {chapter_index} 的分块已全部取完。"
+            f"请确认所有译文都已通过 store_translation_chunk 写入，然后保存章节。"
+        )
 
-    untranslated_buffer = ctx.deps.untranslated_buffer.get()
+    chunk = pending.pop(0)
+    remaining = len(pending)
+    print(f"正在翻译章节{chapter_index}...（剩余 {remaining} 块）")
+    get_logger().info(
+        f"章节 {chapter_index} 发放分块: tokens={EpubTools.count_tokens(chunk)} "
+        f"chars={len(chunk)} tags={_count_tags(chunk)}，剩余 {remaining} 块"
+    )
 
-    # 返回待翻译的内容，实际的翻译由 Agent 自己完成
-    return untranslated_buffer
+    hint = (
+        "取完了，翻译并存入后即可保存本章。"
+        if remaining == 0
+        else f"本章还剩 {remaining} 块，存入本块译文后请继续调用本工具。"
+    )
+    # 提示放在正文之后，避免模型误把它当作待翻译内容的一部分抄进译文
+    return f"{chunk}\n\n---\n[系统提示] {hint}"
 
 
 @epub_toolset.tool
@@ -197,11 +288,27 @@ def store_translation_chunk(
     if chapter_index < 1 or chapter_index > len(ctx.deps.chapters):
         return f"错误：章节索引 {chapter_index} 超出范围"
 
+    if not translated_html.strip():
+        return "错误：传入的译文为空"
+
     prev = ctx.deps.translation_buffer.get(chapter_index, "")
     ctx.deps.translation_buffer[chapter_index] = prev + translated_html
 
     total = len(ctx.deps.translation_buffer[chapter_index])
-    return f"✓ 已存储章节 {chapter_index} 的翻译片段（累计 {total} 字符）"
+    remaining = len(ctx.deps.untranslated_buffer.get(chapter_index, []))
+    get_logger().info(
+        f"章节 {chapter_index} 写入译文: chars={len(translated_html)} "
+        f"tags={_count_tags(translated_html)}，累计 {total} 字符，剩余 {remaining} 块"
+    )
+    if remaining > 0:
+        return (
+            f"✓ 已存储章节 {chapter_index} 的翻译片段（累计 {total} 字符）。"
+            f"本章还剩 {remaining} 个分块未取，请继续调用 get_untranslated_content。"
+        )
+    return (
+        f"✓ 已存储章节 {chapter_index} 的翻译片段（累计 {total} 字符）。"
+        f"本章分块已全部取完，确认译文完整后可调用 save_translated_chapter 保存。"
+    )
 
 
 @epub_toolset.tool
@@ -210,7 +317,7 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
     保存翻译后的章节
 
     从翻译缓冲区中取出之前通过 store_translation_chunk 存入的内容，保存到 EPUB。
-    调用前需确保已通过 store_translation_chunk 写入翻译内容。
+    调用前必须确保该章节的所有分块都已取出并翻译写入。
 
     Args:
         chapter_index: 章节索引（从 1 开始）
@@ -218,9 +325,18 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
     Returns:
         保存结果消息
     """
-    print(f"正在保存章节[{chapter_index}]...")
     if chapter_index < 1 or chapter_index > len(ctx.deps.chapters):
         return f"错误：章节索引 {chapter_index} 超出范围"
+
+    # 护栏 1：还有分块没取出来翻译，说明会漏内容
+    remaining = len(ctx.deps.untranslated_buffer.get(chapter_index, []))
+    if remaining > 0:
+        print(f"  ⤺ 章节 {chapter_index} 保存被拒：还有 {remaining} 块未翻译")
+        get_logger().rejection(chapter_index, f"还有 {remaining} 块未翻译")
+        return (
+            f"错误：章节 {chapter_index} 还有 {remaining} 个分块未翻译，不能保存。"
+            f"请继续调用 get_untranslated_content 取出剩余分块翻译。"
+        )
 
     chapter = ctx.deps.chapters[chapter_index - 1]
     chapter_id = chapter.get_id()
@@ -228,10 +344,62 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
     if not chapter_id:
         return "错误：章节id获取为空"
 
-    # 从缓冲区取翻译内容
-    translated_html = ctx.deps.translation_buffer.pop(chapter_index, "")
+    translated_html = ctx.deps.translation_buffer.get(chapter_index, "")
     if not translated_html:
-        return "错误：未找到翻译内容，请先调用 store_translation_chunk 写入翻译"
+        print(f"  ⤺ 章节 {chapter_index} 保存被拒：缓冲区为空")
+        get_logger().rejection(chapter_index, "翻译缓冲区为空")
+        return (
+            f"错误：章节 {chapter_index} 的翻译缓冲区为空，"
+            f"请先调用 store_translation_chunk 写入译文再保存。"
+        )
+
+    # 护栏 2：译文标签数远少于原文，说明有整段内容被省略。
+    # 用标签数而非字符数：中文译文字符数天然比英文少一半左右，按字符判断会误报。
+    # 首次拒绝并要求补齐，第二次仍不达标则放行并告警，避免卡死在重试循环。
+    source_tags = ctx.deps.source_tags.get(chapter_index, 0)
+    actual_tags = _count_tags(translated_html)
+    tags_missing = source_tags > 0 and actual_tags < source_tags * MIN_TAG_RATIO
+    rejections = ctx.deps.save_rejections.get(chapter_index, 0)
+
+    if tags_missing and rejections < 1:
+        ctx.deps.save_rejections[chapter_index] = rejections + 1
+        print(
+            f"  ⤺ 章节 {chapter_index} 保存被拒："
+            f"标签数 {actual_tags}/{source_tags}，疑似漏译"
+        )
+        logger = get_logger()
+        logger.rejection(chapter_index, f"标签数 {actual_tags}/{source_tags}，疑似漏译")
+        logger.dump_buffer(chapter_index, translated_html)
+        return (
+            f"错误：章节 {chapter_index} 的译文只有 {actual_tags} 个 HTML 标签，"
+            f"而原文有 {source_tags} 个，说明有内容被省略了。\n"
+            f"注意：不要重新获取原文，已取出的分块不会再发放。"
+            f"请把之前遗漏未译的那部分内容补译，"
+            f"用 store_translation_chunk 追加写入（会自动拼接到已有译文后面），"
+            f"然后再次保存。"
+        )
+
+    print(f"正在保存章节[{chapter_index}]...")
+    get_logger().json_line(
+        {
+            "event": "save_chapter",
+            "chapter": chapter_index,
+            "chars": len(translated_html),
+            "tags": actual_tags,
+            "source_tags": source_tags,
+            "tags_missing": tags_missing,
+            "rejections": rejections,
+        }
+    )
+    if tags_missing:
+        print(
+            f"⚠️  章节 {chapter_index} 译文可能不完整："
+            f"标签数 {actual_tags}/{source_tags}"
+        )
+
+    # 确认无误后才真正消费缓冲区
+    ctx.deps.translation_buffer.pop(chapter_index, None)
+    ctx.deps.untranslated_buffer.pop(chapter_index, None)
 
     # 更新章节内容
     chapter.set_content(translated_html.encode("utf-8"))
@@ -333,22 +501,14 @@ def translate_toc(ctx: RunContext[EpubContext]) -> str:
     if not book.toc:
         return "此书没有目录"
 
-    def extract_toc_titles(toc_items, level=0):
-        """递归提取目录标题"""
-        titles = []
-        for item in toc_items:
-            if isinstance(item, epub.Link):
-                titles.append(f"{'  ' * level}- {item.title}")
-            elif isinstance(item, tuple):
-                section, children = item
-                if isinstance(section, epub.Link):
-                    titles.append(f"{'  ' * level}- {section.title}")
-                titles.extend(extract_toc_titles(children, level + 1))
-        return titles
+    toc_titles = collect_toc_titles(book.toc)
 
-    toc_titles = extract_toc_titles(book.toc)
-
-    return "目录项:\n" + "\n".join(toc_titles)
+    return (
+        "目录项（共 "
+        + str(len(toc_titles))
+        + " 条，请按相同顺序、相同数量返回译文）:\n"
+        + "\n".join(f"{i}. {t}" for i, t in enumerate(toc_titles, 1))
+    )
 
 
 @epub_toolset.tool
@@ -370,37 +530,63 @@ def save_translated_toc(
     if not book.toc:
         return "此书没有目录，无需保存"
 
-    # 这里需要重建目录结构
-    # 为简化，我们假设标题数量匹配
-    def update_toc_titles(toc_items, titles_iter):
-        """递归更新目录标题"""
-        updated = []
-        for item in toc_items:
-            if isinstance(item, epub.Link):
-                new_title = next(titles_iter, item.title)
-                updated.append(epub.Link(item.href, new_title, item.uid))
-            elif isinstance(item, tuple):
-                section, children = item
-                if isinstance(section, epub.Link):
-                    new_title = next(titles_iter, section.title)
-                    new_section = epub.Link(section.href, new_title, section.uid)
-                else:
-                    new_section = section
-                updated_children = update_toc_titles(children, titles_iter)
-                updated.append((new_section, updated_children))
-        return updated
+    original_titles = collect_toc_titles(book.toc)
+    if len(translated_titles) != len(original_titles):
+        # 数量对不上会导致标题整体错位，宁可让模型重来
+        get_logger().rejection(
+            0,
+            f"目录条目数不符：收到 {len(translated_titles)}，应为 {len(original_titles)}",
+        )
+        return (
+            f"错误：目录共 {len(original_titles)} 条，但收到 {len(translated_titles)} 条译文。"
+            f"请按完全相同的顺序和数量重新提交。"
+        )
 
-    titles_iter = iter(translated_titles)
-    book.toc = update_toc_titles(book.toc, titles_iter)
+    book.toc = apply_toc_titles(book.toc, iter(translated_titles))
+
+    # 侧边栏目录来自导航文档，ebooklib 不会用 book.toc 重建它，必须手动同步
+    nav_updated = sync_nav_documents(ctx.deps, original_titles, translated_titles)
 
     # 更新进度（如果启用缓存）
     if ctx.deps.cache_manager and ctx.deps.cache_key:
         progress = ctx.deps.cache_manager.load_progress(ctx.deps.cache_key)
         if progress:
             progress.toc_translated = True
+            # 缓存译文本身：续译时 book.toc 会重新从原书读出，
+            # 只记一个布尔量的话，跳过翻译就等于退回原文
+            progress.toc_titles = list(translated_titles)
             ctx.deps.cache_manager.save_progress(ctx.deps.cache_key, progress)
 
+    if nav_updated:
+        return f"✓ 目录已更新（侧边栏导航同步 {nav_updated} 条）"
     return "✓ 目录已更新"
+
+
+def sync_nav_documents(
+    ctx: EpubContext, original_titles: List[str], translated_titles: List[str]
+) -> int:
+    """把已保存的目录译文同步进 EPUB3 导航文档（侧边栏目录）。
+
+    nav.xhtml 不在 book.toc 体系里（ebooklib 写盘时原样回写），
+    所以目录译文要另写回导航文档的 <a> 文本。按标题文本做映射：
+    book.toc 与 nav 的条目一一对应（同为 EPUB 的 toc 语义），
+    标题文本是两者的公共键。返回替换的条目数。
+    """
+    mapping = dict(zip(original_titles, translated_titles))
+    logger = get_logger()
+    total = 0
+    for nav_item in EpubTools.find_nav_documents(ctx.book):
+        try:
+            content = nav_item.get_content().decode("utf-8", errors="ignore")  # type: ignore
+        except Exception:
+            logger.error(f"导航文档解码失败: {nav_item.get_name()}")
+            continue
+        new_content, replaced = EpubTools.apply_nav_labels(content, mapping)
+        if replaced:
+            nav_item.set_content(new_content.encode("utf-8"))
+            logger.info(f"导航文档 {nav_item.get_name()} 同步 {replaced} 条目录译文")
+        total += replaced
+    return total
 
 
 @epub_toolset.tool
@@ -507,12 +693,15 @@ def save_translated_image(
     return f"✓ 已保存图片 {image_index}: {img_name}"
 
 
-@epub_toolset.tool
-def finalize_epub(ctx: RunContext[EpubContext], output_path: str) -> str:
+def finalize_epub(ctx: EpubContext, output_path: str) -> str:
     """
     完成翻译，保存 EPUB 文件
 
+    这不是 Agent 工具：写盘时机由 Python 在校验完成度后决定，
+    避免模型中途或漏章时提前落盘。
+
     Args:
+        ctx: EPUB 翻译上下文
         output_path: 输出文件路径
 
     Returns:
@@ -520,9 +709,9 @@ def finalize_epub(ctx: RunContext[EpubContext], output_path: str) -> str:
     """
     print("正在保存文件...")
     # 设置语言
-    EpubTools.set_language(ctx.deps.book, ctx.deps.target_language)
+    EpubTools.set_language(ctx.book, ctx.target_language)
 
     # 保存文件
-    epub.write_epub(output_path, ctx.deps.book)
+    epub.write_epub(output_path, ctx.book)
 
     return f"✓ EPUB 文件已保存: {output_path}"

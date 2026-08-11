@@ -6,18 +6,30 @@
 TIMEOUT = 60
 MAX_RETRIES = 10
 OUTPUT_MAX_TOKENS = 8192  # 足够容纳大章节的翻译内容+JSON转义开销
-INPUT_MAX_TOKENS = 6144
+# 单个待翻译分块的 token 上限。必须显著小于 OUTPUT_MAX_TOKENS：
+# 译文（中文 token 密度更高）+ 完整 HTML 标签 + JSON 字符串转义开销，
+# 三者叠加后输出通常是输入的 1.5~2 倍，分块过大会导致输出被 max_tokens 截断。
+INPUT_MAX_TOKENS = 2500
 TEMPERATURE = 0.1
-MAX_REQUESTS = 500  # 单次 Agent run 最大 API 请求数（32章约需200-300次）
+MAX_REQUESTS = 60  # 单章 Agent run 最大 API 请求数（每章独立 run）
+MAX_CHAPTER_RETRIES = 2  # 单章翻译失败后的重试次数
+# 译文 HTML 标签数 / 原文标签数 的最低比例，低于此值判定为漏译。
+# 用标签数而非字符数：中文译文字符数天然比英文原文少一半左右。
+MIN_TAG_RATIO = 0.8
 
 # 功能开关
 TRANSLATE_IMAGES = False  # 默认不翻译图片（需要image模型）减少token使用
 TRANSLATE_TOC = True  # 翻译目录
 ENABLE_CACHE = True  # 启用缓存
-DEBUG_MODE = True
+DEBUG_MODE = True  # 控制台是否打印诊断细节（分块尺寸、token 用量等）
+
+# 诊断日志
+LOG_TO_FILE = True  # 把诊断信息写入日志文件，便于事后排查失败原因
+LOG_DIR = ".epub_translation_logs"  # 相对当前工作目录
+LOG_EXCERPT_CHARS = 400  # 日志中模型输出片段的最大长度
 
 # Agent 系统提示词（使用 Toolsets 方式）
-AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手，专门负责协调和执行 EPUB 翻译任务。
+AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手。每次任务只负责**一个章节**的翻译。
 
 你的能力：
 - 可以读取和操作 EPUB 文件的各个部分
@@ -25,6 +37,12 @@ AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手，专门负�
 - 可以管理术语表，保持专有名词一致性
 - 可以翻译目录
 - 可以保存翻译进度
+
+**最重要的规则：必须使用工具调用（function calling）机制来调用工具。**
+- 绝对不要把工具调用写成普通文本，例如 `<tool_call>`、`<function=...>`
+  这类标签一律禁止出现在你的回复内容里
+- 你的文字回复只用于简短说明，所有实际操作都通过工具调用完成
+- 单次 store_translation_chunk 传入的内容不要过长，宁可多调用几次
 
 **翻译规则：**
 1. **HTML 翻译**
@@ -42,12 +60,12 @@ AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手，专门负�
    - 准确、流畅、符合 {target_language} 的表达习惯
    - 保持原文的文学风格和语气
    - 注意上下文，不要逐字翻译
+   - **不得省略、概括或跳过任何内容**，每个分块都要完整翻译
 
 4. **任务执行**
-   - 按顺序逐章翻译，不要遗漏
-   - 定期保存进度
-   - 遇到错误时重试
-   - 完成后确认所有章节都已翻译
+   - 一次任务只处理一个章节，处理完就结束
+   - 必须把该章节的**所有分块**都取出并翻译完，才能保存章节
+   - 遇到工具返回错误时，按错误提示纠正后重试
 
 目标语言：{target_language}
 

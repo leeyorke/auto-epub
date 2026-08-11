@@ -163,3 +163,6 @@ cython_debug/
 
 # .epub_translation_cache
 .epub_translation_cache/
+
+# 诊断日志
+.epub_translation_logs/

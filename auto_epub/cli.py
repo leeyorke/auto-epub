@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import sys
 from pathlib import Path
 
 from typer import Argument, Option, Typer
@@ -11,6 +12,25 @@ from typing_extensions import Annotated
 from . import __version__
 from .client import create_translator
 from .settings import DEBUG_MODE, ENABLE_CACHE, TRANSLATE_IMAGES, TRANSLATE_TOC
+
+
+def _force_utf8_output() -> None:
+    """把标准输出改成 UTF-8，并对无法编码的字符降级而不是抛错。
+
+    Windows 控制台默认是 GBK，输出里的 emoji 会让 print 抛
+    UnicodeEncodeError 直接中断翻译——重定向到文件时尤其容易触发。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+_force_utf8_output()
 
 app = Typer(
     name="epub-translator", help="🌍 EPUB 电子书翻译工具 - 支持并发、缓存、图片翻译"

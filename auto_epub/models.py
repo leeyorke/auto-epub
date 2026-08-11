@@ -43,4 +43,8 @@ class TranslationProgress(BaseModel):
     failed_chapters: List[str] = Field(default_factory=list)
     glossary: Dict[str, str] = Field(default_factory=dict)
     toc_translated: bool = False
+    # 译后的目录标题（按 book.toc 的递归顺序）。必须缓存：book.toc 每次
+    # 都从原始 EPUB 重新读出，续译时若只看 toc_translated 就跳过，
+    # 产出的 toc.ncx 会退回原文。
+    toc_titles: List[str] = Field(default_factory=list)
     images_translated: Dict[str, bool] = Field(default_factory=dict)

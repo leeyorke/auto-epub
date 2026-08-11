@@ -5,7 +5,7 @@ EPUB Translator - 智能电子书翻译工具
 支持并发翻译、断点续传、图片翻译等功能
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "leeyorke"
 
 from .agent_tools import EpubContext, epub_toolset
