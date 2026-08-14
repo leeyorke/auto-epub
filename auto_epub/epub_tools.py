@@ -10,6 +10,7 @@ import tiktoken
 from bs4 import BeautifulSoup, NavigableString, Tag
 from ebooklib import ITEM_DOCUMENT, ITEM_IMAGE, epub
 
+from .logger import get_logger
 from .settings import INPUT_MAX_TOKENS
 
 
@@ -57,7 +58,7 @@ class EpubTools:
         try:
             content = data.decode("utf-8", errors="ignore")
         except Exception as e:
-            print(f"❌ 错误 - {type(e).__name__}")
+            get_logger().error(f"文档解码失败 ({item.get_name()}): {type(e).__name__}")
             return False
         else:
             # 排除没有 body 标签的文档

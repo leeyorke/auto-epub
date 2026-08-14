@@ -14,6 +14,12 @@ python main.py translate book.epub -l zh
 # 续译（默认开启，可显式指定）
 python main.py translate book.epub -l zh --resume
 
+# 显示诊断细节（工具调用序列、被拒译文路径等）
+python main.py translate book.epub -l zh -v
+
+# 只输出错误（静默进度与摘要）
+python main.py translate book.epub -l zh -q
+
 # 清理缓存
 python main.py clear-cache book.epub -l zh
 
@@ -108,7 +114,7 @@ CLI (typer) → EpubTranslator.translate_epub()
 - 每次 save 被拒的原因；标签数不达标时把被拒译文另存为 `*_chN_rejected.html`
 - `DATA` 前缀的 JSON 行（`save_chapter` / `chapter_failed` 等），便于脚本统计失败分布
 
-`get_logger()` 是模块级单例——`agent_tools.py` 里的工具函数拿不到 translator 实例。`DEBUG_MODE` 只控制控制台摘要，文件始终记录完整信息。
+`get_logger()` 是模块级单例——`agent_tools.py` 里的工具函数拿不到 translator 实例。控制台输出详细程度由 `ConsoleLevel` 分级控制（`QUIET/NORMAL/VERBOSE/DEBUG`）：CLI 用 `-v`（升到 DEBUG）/`-q`（降到 QUIET，只出错误）注入，编程式调用用 `set_console_level()` 或 `translate_epub(console_level=...)`；错误一律打到 stderr 且不受等级限制。**文件日志不受等级影响，始终记录完整信息。**
 
 ### 项目特有约定
 

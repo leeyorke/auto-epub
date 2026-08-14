@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from .logger import get_logger
 from .models import TranslationProgress
 
 
@@ -35,7 +36,7 @@ class CacheManager:
                 data = json.loads(cache_file.read_text(encoding="utf-8"))
                 return TranslationProgress(**data)
             except Exception as e:
-                print(f"警告: 加载缓存失败 - {e}")
+                get_logger().error(f"加载缓存失败: {e}")
                 return None
         return None
 

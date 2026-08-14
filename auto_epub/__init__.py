@@ -10,6 +10,7 @@ __author__ = "leeyorke"
 
 from .agent_tools import EpubContext, epub_toolset
 from .client import create_epub_agent, create_translator
+from .logger import ConsoleLevel, set_console_level
 from .models import (
     ChapterTranslation,
     ImageTranslationResult,
@@ -24,6 +25,8 @@ __all__ = [
     "create_epub_agent",
     "epub_toolset",
     "EpubContext",
+    "ConsoleLevel",
+    "set_console_level",
     "TranslationResult",
     "ImageTranslationResult",
     "TranslationProgress",

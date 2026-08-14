@@ -11,7 +11,7 @@ OUTPUT_MAX_TOKENS = 8192  # 足够容纳大章节的翻译内容+JSON转义开�
 # 三者叠加后输出通常是输入的 1.5~2 倍，分块过大会导致输出被 max_tokens 截断。
 INPUT_MAX_TOKENS = 2500
 TEMPERATURE = 0.1
-MAX_REQUESTS = 60  # 单章 Agent run 最大 API 请求数（每章独立 run）
+MAX_REQUESTS = 128  # 单章 Agent run 最大 API 请求数（每章独立 run）
 MAX_CHAPTER_RETRIES = 2  # 单章翻译失败后的重试次数
 # 译文 HTML 标签数 / 原文标签数 的最低比例，低于此值判定为漏译。
 # 用标签数而非字符数：中文译文字符数天然比英文原文少一半左右。
@@ -21,9 +21,9 @@ MIN_TAG_RATIO = 0.8
 TRANSLATE_IMAGES = False  # 默认不翻译图片（需要image模型）减少token使用
 TRANSLATE_TOC = True  # 翻译目录
 ENABLE_CACHE = True  # 启用缓存
-DEBUG_MODE = True  # 控制台是否打印诊断细节（分块尺寸、token 用量等）
 
 # 诊断日志
+# 控制台详细程度由 CLI 的 -v/-q 控制（见 logger.ConsoleLevel），文件日志始终完整
 LOG_TO_FILE = True  # 把诊断信息写入日志文件，便于事后排查失败原因
 LOG_DIR = ".epub_translation_logs"  # 相对当前工作目录
 LOG_EXCERPT_CHARS = 400  # 日志中模型输出片段的最大长度

@@ -12,7 +12,7 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from .cache_manager import CacheManager
 from .epub_tools import EpubTools
-from .logger import get_logger
+from .logger import ConsoleLevel, get_logger
 from .settings import MIN_TAG_RATIO, TRANSLATE_IMAGES
 
 _TAG_RE = re.compile(r"<[a-zA-Z/][^>]*>")
@@ -113,7 +113,6 @@ class EpubContext:
         try:
             content = data.decode("utf-8", errors="ignore")
         except Exception as e:
-            print(f"❌ 章节 {chapter_index} 解码失败 - {type(e).__name__}")
             get_logger().error(f"章节 {chapter_index} 解码失败: {type(e).__name__}")
             return 0
 
@@ -154,7 +153,7 @@ def get_book_info(ctx: RunContext[EpubContext]) -> str:
 
     返回书籍的标题、作者、语言、章节数等信息
     """
-    print("正在获取书籍信息...")
+    get_logger().console("正在获取书籍信息...")
     book = ctx.deps.book
     title = book.get_metadata("DC", "title")
     author = book.get_metadata("DC", "creator")
@@ -181,7 +180,7 @@ def list_chapters(ctx: RunContext[EpubContext]) -> str:
 
     返回章节列表，包括章节 ID 和标题
     """
-    print("正在查看章节信息...")
+    get_logger().console("正在查看章节信息...")
     chapters_info = []
 
     # 获取已完成章节列表
@@ -218,7 +217,7 @@ def is_untranslated_buffer_empty(
     """
     remaining = len(ctx.deps.untranslated_buffer.get(chapter_index, []))
     if remaining == 0:
-        print(f"章节{chapter_index}的所有内容片段已全部翻译完成")
+        get_logger().console(f"章节{chapter_index}的所有内容片段已全部翻译完成")
         return f"✓ 章节 {chapter_index} 的分块已全部取完，可以调用 save_translated_chapter 保存。"
     return (
         f"章节 {chapter_index} 还剩 {remaining} 个分块未翻译，"
@@ -245,7 +244,7 @@ def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -
 
     pending = ctx.deps.untranslated_buffer[chapter_index]
     if not pending:
-        print(f"章节{chapter_index}的所有内容片段已全部翻译完成")
+        get_logger().console(f"章节{chapter_index}的所有内容片段已全部翻译完成")
         return (
             f"章节 {chapter_index} 的分块已全部取完。"
             f"请确认所有译文都已通过 store_translation_chunk 写入，然后保存章节。"
@@ -253,7 +252,7 @@ def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -
 
     chunk = pending.pop(0)
     remaining = len(pending)
-    print(f"正在翻译章节{chapter_index}...（剩余 {remaining} 块）")
+    get_logger().console(f"正在翻译章节{chapter_index}...（剩余 {remaining} 块）")
     get_logger().info(
         f"章节 {chapter_index} 发放分块: tokens={EpubTools.count_tokens(chunk)} "
         f"chars={len(chunk)} tags={_count_tags(chunk)}，剩余 {remaining} 块"
@@ -331,7 +330,6 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
     # 护栏 1：还有分块没取出来翻译，说明会漏内容
     remaining = len(ctx.deps.untranslated_buffer.get(chapter_index, []))
     if remaining > 0:
-        print(f"  ⤺ 章节 {chapter_index} 保存被拒：还有 {remaining} 块未翻译")
         get_logger().rejection(chapter_index, f"还有 {remaining} 块未翻译")
         return (
             f"错误：章节 {chapter_index} 还有 {remaining} 个分块未翻译，不能保存。"
@@ -346,7 +344,6 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
 
     translated_html = ctx.deps.translation_buffer.get(chapter_index, "")
     if not translated_html:
-        print(f"  ⤺ 章节 {chapter_index} 保存被拒：缓冲区为空")
         get_logger().rejection(chapter_index, "翻译缓冲区为空")
         return (
             f"错误：章节 {chapter_index} 的翻译缓冲区为空，"
@@ -363,10 +360,6 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
 
     if tags_missing and rejections < 1:
         ctx.deps.save_rejections[chapter_index] = rejections + 1
-        print(
-            f"  ⤺ 章节 {chapter_index} 保存被拒："
-            f"标签数 {actual_tags}/{source_tags}，疑似漏译"
-        )
         logger = get_logger()
         logger.rejection(chapter_index, f"标签数 {actual_tags}/{source_tags}，疑似漏译")
         logger.dump_buffer(chapter_index, translated_html)
@@ -379,7 +372,7 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
             f"然后再次保存。"
         )
 
-    print(f"正在保存章节[{chapter_index}]...")
+    get_logger().console(f"正在保存章节[{chapter_index}]...")
     get_logger().json_line(
         {
             "event": "save_chapter",
@@ -392,9 +385,10 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
         }
     )
     if tags_missing:
-        print(
+        get_logger().console(
             f"⚠️  章节 {chapter_index} 译文可能不完整："
-            f"标签数 {actual_tags}/{source_tags}"
+            f"标签数 {actual_tags}/{source_tags}",
+            ConsoleLevel.VERBOSE,
         )
 
     # 确认无误后才真正消费缓冲区
@@ -484,7 +478,7 @@ def get_translation_progress(ctx: RunContext[EpubContext]) -> str:
 - 目录已翻译: {"是" if progress.toc_translated else "否"}
 - 图片翻译: {sum(progress.images_translated.values())}/{len(progress.images_translated)}
 """
-    print(f"翻译进度: {completed}/{total}")
+    get_logger().console(f"翻译进度: {completed}/{total}")
     return status
 
 
@@ -495,7 +489,7 @@ def translate_toc(ctx: RunContext[EpubContext]) -> str:
 
     返回需要翻译的目录项列表
     """
-    print("正在翻译目录...")
+    get_logger().console("正在翻译目录...")
     book = ctx.deps.book
 
     if not book.toc:
@@ -524,7 +518,7 @@ def save_translated_toc(
     Returns:
         保存结果
     """
-    print("正在保存目录...")
+    get_logger().console("正在保存目录...")
     book = ctx.deps.book
 
     if not book.toc:
@@ -707,7 +701,7 @@ def finalize_epub(ctx: EpubContext, output_path: str) -> str:
     Returns:
         保存结果
     """
-    print("正在保存文件...")
+    get_logger().console("正在保存文件...")
     # 设置语言
     EpubTools.set_language(ctx.book, ctx.target_language)
 

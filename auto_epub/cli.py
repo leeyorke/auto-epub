@@ -6,12 +6,13 @@ import asyncio
 import sys
 from pathlib import Path
 
-from typer import Argument, Option, Typer
+from typer import Argument, Exit, Option, Typer
 from typing_extensions import Annotated
 
 from . import __version__
 from .client import create_translator
-from .settings import DEBUG_MODE, ENABLE_CACHE, TRANSLATE_IMAGES, TRANSLATE_TOC
+from .logger import ConsoleLevel, get_logger, set_console_level
+from .settings import ENABLE_CACHE, TRANSLATE_IMAGES, TRANSLATE_TOC
 
 
 def _force_utf8_output() -> None:
@@ -57,6 +58,18 @@ def translate(
     resume: Annotated[
         bool, Option("--resume/--no-resume", help="是否启用断点续传（从缓存恢复）")
     ] = True,
+    verbose: Annotated[
+        int,
+        Option(
+            "-v",
+            "--verbose",
+            count=True,
+            help="提高控制台详细程度，可叠加：-v 显示工具调用、被拒原因等诊断细节",
+        ),
+    ] = 0,
+    quiet: Annotated[
+        bool, Option("-q", "--quiet", help="只输出错误，静默其他所有输出")
+    ] = False,
 ) -> None:
     """
     翻译 EPUB 文件
@@ -74,18 +87,33 @@ def translate(
 
       # 不使用缓存（重新翻译）
       epub-translator book.epub -l zh --no-resume
+
+      # 显示诊断细节 / 只输出错误
+      epub-translator book.epub -l zh -v
+      epub-translator book.epub -l zh -q
     """
-    # 验证文件存在
+    if quiet and verbose:
+        print("❌ 错误：-q/--quiet 与 -v/--verbose 不能同时使用")
+        raise Exit(code=1)
+
+    # 控制台详细程度：默认 VERBOSE（进度+摘要），-v 升到 DEBUG，-q 降到 QUIET。
+    # 文件日志不受影响，始终完整记录。
+    level = (
+        ConsoleLevel.QUIET
+        if quiet
+        else ConsoleLevel(min(ConsoleLevel.VERBOSE + verbose, ConsoleLevel.DEBUG))
+    )
+    set_console_level(level)
     if not Path(file_path).exists():
-        print(f"❌ 错误：文件不存在 - {file_path}")
-        return
+        get_logger().error(f"文件不存在 - {file_path}")
+        raise Exit(code=1)
 
     if not file_path.endswith(".epub"):
-        print(f"❌ 错误：不是 EPUB 文件 - {file_path}")
-        return
+        get_logger().error(f"不是 EPUB 文件 - {file_path}")
+        raise Exit(code=1)
 
     # 创建翻译器
-    print("\n🚀 初始化翻译器...")
+    get_logger().console("\n🚀 初始化翻译器...")
     translator = create_translator(
         target_language=target_language, cache_enabled=ENABLE_CACHE and resume
     )
@@ -102,18 +130,18 @@ def translate(
             )
         )
 
-        print("\n🎉 翻译成功完成！")
-        print(f"📁 输出文件：{output_file}")
+        get_logger().console("\n🎉 翻译成功完成！")
+        get_logger().console(f"📁 输出文件：{output_file}")
 
     except KeyboardInterrupt:
-        print("\n\n⚠️  用户中断翻译")
-        print("💡 提示：下次运行时使用 --resume 可以继续翻译")
+        print("\n\n⚠️  用户中断翻译", file=sys.stderr)
+        print("💡 提示：下次运行时使用 --resume 可以继续翻译", file=sys.stderr)
 
     except Exception as e:
-        print(f"\n❌ 翻译失败：{e}")
+        get_logger().error(f"翻译失败：{e}")
         import traceback
 
-        if DEBUG_MODE:
+        if get_logger().console_level >= ConsoleLevel.DEBUG:
             traceback.print_exc()
 
 

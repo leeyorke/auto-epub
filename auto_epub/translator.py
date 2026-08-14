@@ -3,6 +3,7 @@ EPUB 翻译器 - 使用 Agent + Toolsets 方式
 """
 
 from pathlib import Path
+from typing import Optional, Union
 
 from ebooklib import epub
 from pydantic_ai import Agent, UsageLimits
@@ -16,7 +17,7 @@ from .agent_tools import (
 )
 from .cache_manager import CacheManager
 from .epub_tools import EpubTools
-from .logger import get_logger, init_logger
+from .logger import ConsoleLevel, get_logger, init_logger
 from .models import TranslationProgress
 from .settings import MAX_CHAPTER_RETRIES, MAX_REQUESTS
 
@@ -44,6 +45,7 @@ class EpubTranslator:
         translate_images: bool = False,
         translate_toc: bool = True,
         resume: bool = True,
+        console_level: Optional[Union[int, ConsoleLevel]] = None,
     ) -> str:
         """
         翻译整个 EPUB 文件
@@ -54,23 +56,25 @@ class EpubTranslator:
             translate_images: 是否翻译图片
             translate_toc: 是否翻译目录
             resume: 是否支持断点续传
+            console_level: 控制台详细程度（None 表示沿用模块级默认）
 
         Returns:
             输出文件路径
         """
-        print(f"\n📚 开始翻译 EPUB: {input_file}")
-        print(f"🎯 目标语言: {target_language}\n")
+        # 诊断日志：文件名做日志名，一次运行一个文件；
+        # 控制台详细程度由 console_level 注入，文件日志始终完整
+        self.logger = init_logger(Path(input_file).stem, console_level=console_level)
 
-        # 诊断日志：文件名做日志名，一次运行一个文件
-        self.logger = init_logger(Path(input_file).stem)
+        self.logger.console(f"\n📚 开始翻译 EPUB: {input_file}")
+        self.logger.console(f"🎯 目标语言: {target_language}\n")
         self.logger.info(f"输入文件: {input_file}，目标语言: {target_language}")
         if self.logger.log_file:
-            print(f"📝 诊断日志: {self.logger.log_file}\n")
+            self.logger.console(f"📝 诊断日志: {self.logger.log_file}\n")
 
         # 1. 加载 EPUB
         book = epub.read_epub(input_file)
         source_lang = EpubTools.get_default_language(book)
-        print(f"📖 源语言: {source_lang}")
+        self.logger.console(f"📖 源语言: {source_lang}")
 
         # 2. 准备缓存
         cache_key = None
@@ -84,14 +88,14 @@ class EpubTranslator:
                 progress = self.cache_manager.load_progress(cache_key)
 
                 if progress:
-                    print(
+                    self.logger.console(
                         f"♻️  发现缓存，已完成 {len(progress.completed_chapters)}/{progress.total_chapters} 章节"
                     )
                     glossary = progress.glossary
 
         # 3. 初始化进度
         chapters = EpubTools.get_all_chapters(book)
-        print(f"\n共{len(chapters)}章...\n")
+        self.logger.console(f"\n共{len(chapters)}章...\n")
 
         if not progress:
             progress = TranslationProgress(
@@ -120,16 +124,16 @@ class EpubTranslator:
         # 6. 生成输出路径
         output_file = self._generate_output_path(input_file, target_language)
 
-        print("\n🤖 启动智能翻译 Agent...\n")
+        self.logger.console("\n🤖 启动智能翻译 Agent...\n")
 
         # 7. 由 Python 控制章节循环，每章一次独立 run，避免上下文累积
         pending = self._pending_chapters(ctx, progress)
         if not pending:
-            print("所有章节均已翻译，直接生成文件")
+            self.logger.console("所有章节均已翻译，直接生成文件")
 
         for position, (index, chapter) in enumerate(pending, 1):
             title = chapter.get_name() or chapter.get_id()
-            print(f"\n[{position}/{len(pending)}] 章节 {index}: {title}")
+            self.logger.console(f"\n[{position}/{len(pending)}] 章节 {index}: {title}")
             ok = await self._translate_chapter_with_retry(ctx, index)
             if not ok:
                 self._mark_failed(ctx, chapter.get_id())  # type: ignore
@@ -166,10 +170,12 @@ class EpubTranslator:
                 missing.append(chapter_id)
 
         if restored:
-            print(f"♻️  已从缓存恢复 {restored} 个章节的译文")
+            self.logger.console(f"♻️  已从缓存恢复 {restored} 个章节的译文")
         if missing:
             # 进度记录说已完成但译文文件丢失，需要重新翻译，否则会静默输出原文
-            print(f"⚠️  {len(missing)} 个章节标记为已完成但缓存内容缺失，将重新翻译")
+            self.logger.console(
+                f"⚠️  {len(missing)} 个章节标记为已完成但缓存内容缺失，将重新翻译"
+            )
             for chapter_id in missing:
                 progress.completed_chapters.remove(chapter_id)
             self.cache_manager.save_progress(cache_key, progress)
@@ -202,16 +208,15 @@ class EpubTranslator:
 
         for attempt in range(1, MAX_CHAPTER_RETRIES + 2):
             if attempt > 1:
-                print(f"  ↻ 第 {attempt} 次尝试")
+                logger.console(f"  ↻ 第 {attempt} 次尝试")
             logger.chapter_start(chapter_index, title, attempt)
 
             # 切分由 Python 完成，不交给模型：模型重复切分会清空已攒的译文
             chunk_count = ctx.prepare_chapter(chapter_index)
             if chunk_count == 0:
-                print(f"  ⚠️  章节 {chapter_index} 内容为空，跳过")
-                logger.error(f"章节 {chapter_index} 内容为空")
+                logger.error(f"章节 {chapter_index} 内容为空，跳过")
                 return False
-            print(f"  切分为 {chunk_count} 块")
+            logger.console(f"  切分为 {chunk_count} 块")
 
             try:
                 result = await self.agent.run(
@@ -220,7 +225,6 @@ class EpubTranslator:
                     usage_limits=UsageLimits(request_limit=MAX_REQUESTS),
                 )  # type: ignore
             except Exception as e:
-                print(f"  ❌ 章节 {chapter_index} 翻译异常: {type(e).__name__}: {e}")
                 logger.error(
                     f"章节 {chapter_index} 第 {attempt} 次尝试抛异常 "
                     f"{type(e).__name__}: {e}"
@@ -232,7 +236,6 @@ class EpubTranslator:
             output = result.output or ""
             if any(marker in output for marker in _LEAKED_TOOL_CALL_MARKERS):
                 # 模型把工具调用写成了纯文本，本轮实际没有落盘
-                print(f"  ❌ 章节 {chapter_index}: 模型输出了文本形式的工具调用")
                 logger.leaked_tool_call(chapter_index, output)
                 continue
 
@@ -240,7 +243,6 @@ class EpubTranslator:
                 logger.info(f"章节 {chapter_index} 第 {attempt} 次尝试保存成功")
                 return True
 
-            print(f"  ❌ 章节 {chapter_index} 未保存成功")
             logger.error(
                 f"章节 {chapter_index} run 正常结束但未落盘，"
                 f"剩余未取分块 {len(ctx.untranslated_buffer.get(chapter_index, []))}，"
@@ -313,9 +315,9 @@ class EpubTranslator:
                     ctx, progress.toc_titles
                 ):
                     return
-                print("\n目录缓存不可用，重新翻译")
+                self.logger.console("\n目录缓存不可用，重新翻译")
 
-        print("\n📑 翻译目录...")
+        self.logger.console("\n📑 翻译目录...")
         prompt = f"""\
 请翻译本书目录到 {ctx.target_language}。
 
@@ -330,8 +332,7 @@ class EpubTranslator:
                 prompt, deps=ctx, usage_limits=UsageLimits(request_limit=MAX_REQUESTS)
             )  # type: ignore
         except Exception as e:
-            print(f"⚠️  目录翻译失败: {type(e).__name__}: {e}")
-            get_logger().error(f"目录翻译失败 {type(e).__name__}: {e}")
+            self.logger.error(f"目录翻译失败 {type(e).__name__}: {e}")
 
     def _restore_cached_toc(self, ctx: EpubContext, cached_titles: list) -> bool:
         """把缓存的目录译文写回 book.toc 和导航文档，返回是否成功"""
@@ -344,12 +345,12 @@ class EpubTranslator:
 
         ctx.book.toc = apply_toc_titles(ctx.book.toc, iter(cached_titles))
         nav_updated = sync_nav_documents(ctx, original_titles, cached_titles)
-        print(f"\n♻️  已从缓存恢复目录译文（侧边栏同步 {nav_updated} 条）")
+        self.logger.console(f"\n♻️  已从缓存恢复目录译文（侧边栏同步 {nav_updated} 条）")
         return True
 
     async def _run_image_translation(self, ctx: EpubContext) -> None:
         """单独一次 run 处理图片翻译"""
-        print("\n🖼️  翻译图片...")
+        self.logger.console("\n🖼️  翻译图片...")
         prompt = f"""\
 请翻译本书图片中的文字到 {ctx.target_language}。
 
@@ -365,8 +366,7 @@ class EpubTranslator:
                 prompt, deps=ctx, usage_limits=UsageLimits(request_limit=MAX_REQUESTS)
             )  # type: ignore
         except Exception as e:
-            print(f"⚠️  图片翻译失败: {type(e).__name__}: {e}")
-            get_logger().error(f"图片翻译失败 {type(e).__name__}: {e}")
+            self.logger.error(f"图片翻译失败 {type(e).__name__}: {e}")
 
     def _finalize_and_report(self, ctx: EpubContext, output_file: str) -> str:
         """写盘并如实报告完成情况"""
@@ -381,10 +381,10 @@ class EpubTranslator:
                 total = progress.total_chapters
                 failed = progress.failed_chapters
 
-        print()
-        print(finalize_epub(ctx, output_file))
-
         logger = get_logger()
+        logger.console()
+        logger.console(finalize_epub(ctx, output_file))
+
         logger.json_line(
             {
                 "event": "finish",
@@ -396,15 +396,15 @@ class EpubTranslator:
         )
 
         if completed < total:
-            print(f"\n⚠️  翻译未全部完成：{completed}/{total} 章")
+            logger.console(f"\n⚠️  翻译未全部完成：{completed}/{total} 章")
             if failed:
-                print(f"   失败章节 {len(failed)} 个: {', '.join(failed[:10])}")
-            print("   已生成的文件中，未完成章节仍是原文")
-            print("   可重新运行相同命令（带 --resume）继续翻译剩余章节")
+                logger.console(f"   失败章节 {len(failed)} 个: {', '.join(failed[:10])}")
+            logger.console("   已生成的文件中，未完成章节仍是原文")
+            logger.console("   可重新运行相同命令（带 --resume）继续翻译剩余章节")
         else:
-            print(f"\n✅ 翻译完成：{completed}/{total} 章")
+            logger.console(f"\n✅ 翻译完成：{completed}/{total} 章")
 
-        print(f"📄 输出文件: {output_file}")
+        logger.console(f"📄 输出文件: {output_file}")
         return output_file
 
     def _generate_output_path(self, input_file: str, target_language: str) -> str:
