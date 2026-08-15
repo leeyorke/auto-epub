@@ -65,11 +65,11 @@ class EpubTranslator:
         # 控制台详细程度由 console_level 注入，文件日志始终完整
         self.logger = init_logger(Path(input_file).stem, console_level=console_level)
 
-        self.logger.console(f"\n📚 开始翻译 EPUB: {input_file}")
-        self.logger.console(f"🎯 目标语言: {target_language}\n")
+        self.logger.console(f"📚 开始翻译 EPUB: {input_file}")
+        self.logger.console(f"🎯 目标语言: {target_language}")
         self.logger.info(f"输入文件: {input_file}，目标语言: {target_language}")
         if self.logger.log_file:
-            self.logger.console(f"📝 诊断日志: {self.logger.log_file}\n")
+            self.logger.console(f"📝 诊断日志: {self.logger.log_file}")
 
         # 1. 加载 EPUB
         book = epub.read_epub(input_file)
@@ -95,7 +95,7 @@ class EpubTranslator:
 
         # 3. 初始化进度
         chapters = EpubTools.get_all_chapters(book)
-        self.logger.console(f"\n共{len(chapters)}章...\n")
+        self.logger.console(f"共{len(chapters)}章...")
 
         if not progress:
             progress = TranslationProgress(
@@ -124,7 +124,7 @@ class EpubTranslator:
         # 6. 生成输出路径
         output_file = self._generate_output_path(input_file, target_language)
 
-        self.logger.console("\n🤖 启动智能翻译 Agent...\n")
+        self.logger.console("🤖 启动智能翻译 Agent...")
 
         # 7. 由 Python 控制章节循环，每章一次独立 run，避免上下文累积
         pending = self._pending_chapters(ctx, progress)
@@ -133,7 +133,7 @@ class EpubTranslator:
 
         for position, (index, chapter) in enumerate(pending, 1):
             title = chapter.get_name() or chapter.get_id()
-            self.logger.console(f"\n[{position}/{len(pending)}] 章节 {index}: {title}")
+            self.logger.console(f"[{position}/{len(pending)}] 章节 {index}: {title}")
             ok = await self._translate_chapter_with_retry(ctx, index)
             if not ok:
                 self._mark_failed(ctx, chapter.get_id())  # type: ignore
@@ -208,7 +208,7 @@ class EpubTranslator:
 
         for attempt in range(1, MAX_CHAPTER_RETRIES + 2):
             if attempt > 1:
-                logger.console(f"  ↻ 第 {attempt} 次尝试")
+                logger.console(f"↻ 第 {attempt} 次尝试")
             logger.chapter_start(chapter_index, title, attempt)
 
             # 切分由 Python 完成，不交给模型：模型重复切分会清空已攒的译文
@@ -216,7 +216,7 @@ class EpubTranslator:
             if chunk_count == 0:
                 logger.error(f"章节 {chapter_index} 内容为空，跳过")
                 return False
-            logger.console(f"  切分为 {chunk_count} 块")
+            logger.console(f"切分为 {chunk_count} 块")
 
             try:
                 result = await self.agent.run(
@@ -315,9 +315,9 @@ class EpubTranslator:
                     ctx, progress.toc_titles
                 ):
                     return
-                self.logger.console("\n目录缓存不可用，重新翻译")
+                self.logger.console("目录缓存不可用，重新翻译")
 
-        self.logger.console("\n📑 翻译目录...")
+        self.logger.console("📑 翻译目录...")
         prompt = f"""\
 请翻译本书目录到 {ctx.target_language}。
 
@@ -345,12 +345,12 @@ class EpubTranslator:
 
         ctx.book.toc = apply_toc_titles(ctx.book.toc, iter(cached_titles))
         nav_updated = sync_nav_documents(ctx, original_titles, cached_titles)
-        self.logger.console(f"\n♻️  已从缓存恢复目录译文（侧边栏同步 {nav_updated} 条）")
+        self.logger.console(f"♻️  已从缓存恢复目录译文（侧边栏同步 {nav_updated} 条）")
         return True
 
     async def _run_image_translation(self, ctx: EpubContext) -> None:
         """单独一次 run 处理图片翻译"""
-        self.logger.console("\n🖼️  翻译图片...")
+        self.logger.console("🖼️  翻译图片...")
         prompt = f"""\
 请翻译本书图片中的文字到 {ctx.target_language}。
 
@@ -396,13 +396,15 @@ class EpubTranslator:
         )
 
         if completed < total:
-            logger.console(f"\n⚠️  翻译未全部完成：{completed}/{total} 章")
+            logger.console(f"⚠️  翻译未全部完成：{completed}/{total} 章")
             if failed:
-                logger.console(f"   失败章节 {len(failed)} 个: {', '.join(failed[:10])}")
-            logger.console("   已生成的文件中，未完成章节仍是原文")
-            logger.console("   可重新运行相同命令（带 --resume）继续翻译剩余章节")
+                logger.console(
+                    f"   失败章节 {len(failed)} 个: {', '.join(failed[:10])}"
+                )
+            logger.console("已生成的文件中，未完成章节仍是原文")
+            logger.console("可重新运行相同命令（带 --resume）继续翻译剩余章节")
         else:
-            logger.console(f"\n✅ 翻译完成：{completed}/{total} 章")
+            logger.console(f"✅ 翻译完成：{completed}/{total} 章")
 
         logger.console(f"📄 输出文件: {output_file}")
         return output_file

@@ -365,7 +365,7 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
         logger.dump_buffer(chapter_index, translated_html)
         return (
             f"错误：章节 {chapter_index} 的译文只有 {actual_tags} 个 HTML 标签，"
-            f"而原文有 {source_tags} 个，说明有内容被省略了。\n"
+            f"而原文有 {source_tags} 个，说明有内容被省略了。"
             f"注意：不要重新获取原文，已取出的分块不会再发放。"
             f"请把之前遗漏未译的那部分内容补译，"
             f"用 store_translation_chunk 追加写入（会自动拼接到已有译文后面），"

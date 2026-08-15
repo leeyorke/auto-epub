@@ -47,9 +47,7 @@ class TranslationLogger:
         console_level: Optional[Union[int, ConsoleLevel]] = None,
     ):
         self.console_level = (
-            ConsoleLevel(console_level)
-            if console_level is not None
-            else _console_level
+            ConsoleLevel(console_level) if console_level is not None else _console_level
         )
         self.log_file: Optional[Path] = None
         if not LOG_TO_FILE:
@@ -75,13 +73,15 @@ class TranslationLogger:
             # 日志失败不该影响翻译本身
             self.log_file = None
 
-    def console(self, message: str = "", level: ConsoleLevel = ConsoleLevel.NORMAL) -> None:
+    def console(
+        self, message: str = "", level: ConsoleLevel = ConsoleLevel.NORMAL
+    ) -> None:
         """按控制台详细程度决定是否打印；低于当前等级的消息被丢弃"""
         if self.console_level >= level:
             stamp = datetime.now().strftime("%H:%M:%S")
             level_tag = level.name if level > ConsoleLevel.NORMAL else ""
             if level_tag:
-                print(f"[{stamp}] {level_tag:<5} {message}")
+                print(f"[{stamp}] [{level_tag:<5}] {message}")
             else:
                 print(f"[{stamp}] {message}")
 
