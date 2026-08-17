@@ -5,11 +5,16 @@
 # API 设置
 TIMEOUT = 60
 MAX_RETRIES = 10
-OUTPUT_MAX_TOKENS = 8192  # 足够容纳大章节的翻译内容+JSON转义开销
+OUTPUT_MAX_TOKENS = 16384  # 足够容纳大章节的翻译内容+JSON转义开销
 # 单个待翻译分块的 token 上限。必须显著小于 OUTPUT_MAX_TOKENS：
-# 译文（中文 token 密度更高）+ 完整 HTML 标签 + JSON 字符串转义开销，
-# 三者叠加后输出通常是输入的 1.5~2 倍，分块过大会导致输出被 max_tokens 截断。
-INPUT_MAX_TOKENS = 2500
+# 一次请求的 OUTPUT_MAX_TOKENS 预算要同时装下"推理 token + 译文"，而译文
+# （中文 token 密度更高）+ 完整 HTML 标签 + JSON 转义后，输出是输入的
+# 1.3~2.0 倍（500 组实测：中位 1.32、p99 1.87、最大 1.99）。
+# 按最坏情况留余量：5000 × 2.0 + 6000(推理) ≈ 16000 < 16384，
+# 即使供应商不认 reasoning_effort=low、推理照旧吃掉 6000 token 也不会截断。
+# 调大能成倍减少分块数（进而按平方级降低累计输入 token），但一旦某块的译文
+# 超出预算被截断，同一块重试还会再次超出，整章会耗尽重试次数。
+INPUT_MAX_TOKENS = 5000
 TEMPERATURE = 0.1
 MAX_REQUESTS = 128  # 单章 Agent run 最大 API 请求数（每章独立 run）
 MAX_CHAPTER_RETRIES = 2  # 单章翻译失败后的重试次数
@@ -42,7 +47,8 @@ AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手。每次任�
 - 绝对不要把工具调用写成普通文本，例如 `<tool_call>`、`<function=...>`
   这类标签一律禁止出现在你的回复内容里
 - 你的文字回复只用于简短说明，所有实际操作都通过工具调用完成
-- 单次 store_translation_chunk 传入的内容不要过长，宁可多调用几次
+- 单次 store_translation_chunk 传入的内容不要过长，宁可用同一个 chunk_index
+  多调用几次追加写入
 
 **翻译规则：**
 1. **HTML 翻译**
@@ -64,7 +70,8 @@ AGENT_SYSTEM_PROMPT = """你是专业的 EPUB 电子书翻译助手。每次任�
 
 4. **任务执行**
    - 一次任务只处理一个章节，处理完就结束
-   - 必须把该章节的**所有分块**都取出并翻译完，才能保存章节
+   - 必须让该章节的**每一个分块**都有译文，才能保存章节
+   - 写入译文时必须带上 get_untranslated_content 给出的 chunk_index
    - 遇到工具返回错误时，按错误提示纠正后重试
 
 目标语言：{target_language}

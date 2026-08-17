@@ -36,6 +36,10 @@ class ImageTranslationResult(BaseModel):
 class TranslationProgress(BaseModel):
     """翻译进度（用于缓存）"""
 
+    # 缓存文件名是"绝对路径+目标语言"的 MD5，光看文件名认不出是哪本书，
+    # 因此把书名（EPUB 文件名去后缀，与日志文件同名）记在第一个键上。
+    # 默认空字符串是为了兼容没有这个字段的旧缓存。
+    book_name: str = ""
     source_lang: str
     target_lang: str
     total_chapters: int

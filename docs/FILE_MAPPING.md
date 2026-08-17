@@ -27,9 +27,9 @@
 | **requirements.txt** | 完整锁定依赖（uv 导出） |
 | **pyproject.toml** | 项目配置（uv / ruff） |
 | **README.md** | 完整使用文档 |
-| **CLAUDE.md** | 面向 Claude Code 的代码库指南 |
-| **QUICKSTART.md** | 快速开始指南 |
-| **ARCHITECTURE.md** | 架构设计文档 |
+| **CLAUDE.md** | 面向 Claude Code 的代码库指南（只放命令、导航、红线索引） |
+| **docs/QUICKSTART.md** | 快速开始指南 |
+| **docs/ARCHITECTURE.md** | 架构设计文档 —— 设计决策、不变量、诊断日志的唯一出处 |
 
 ## 重要区分
 

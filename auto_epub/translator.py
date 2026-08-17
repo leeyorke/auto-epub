@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from ebooklib import epub
-from pydantic_ai import Agent, UsageLimits
+from pydantic_ai import Agent, AgentRunResult, UsageLimits
 
 from .agent_tools import (
     EpubContext,
@@ -63,7 +63,8 @@ class EpubTranslator:
         """
         # 诊断日志：文件名做日志名，一次运行一个文件；
         # 控制台详细程度由 console_level 注入，文件日志始终完整
-        self.logger = init_logger(Path(input_file).stem, console_level=console_level)
+        book_name = Path(input_file).stem
+        self.logger = init_logger(book_name, console_level=console_level)
 
         self.logger.console(f"📚 开始翻译 EPUB: {input_file}")
         self.logger.console(f"🎯 目标语言: {target_language}")
@@ -92,6 +93,11 @@ class EpubTranslator:
                         f"♻️  发现缓存，已完成 {len(progress.completed_chapters)}/{progress.total_chapters} 章节"
                     )
                     glossary = progress.glossary
+                    if progress.book_name != book_name:
+                        # 旧缓存没有这个字段（或文件被改名），补上并立即落盘：
+                        # 整本已翻完时后面不会再有 save_progress 把它写出去
+                        progress.book_name = book_name
+                        self.cache_manager.save_progress(cache_key, progress)
 
         # 3. 初始化进度
         chapters = EpubTools.get_all_chapters(book)
@@ -99,6 +105,7 @@ class EpubTranslator:
 
         if not progress:
             progress = TranslationProgress(
+                book_name=book_name,
                 source_lang=source_lang,
                 target_lang=target_language,
                 total_chapters=len(chapters),
@@ -189,15 +196,31 @@ class EpubTranslator:
         ]
 
     def _is_chapter_done(self, ctx: EpubContext, chapter_index: int) -> bool:
-        """以缓存进度为准判断某章是否真的保存成功"""
+        """以缓存进度为准判断某章是否真的完整保存"""
         if not self.cache_manager or not ctx.cache_key:
-            # 未启用缓存时退而求其次：prepare_chapter 会填入待翻译队列，
-            # 只有 save_translated_chapter 成功执行才会把它移除
-            return chapter_index not in ctx.untranslated_buffer
+            # 未启用缓存时看上下文里的落盘标记：
+            # save_translated_chapter 只在判定完整时才写入这个集合
+            return chapter_index in ctx.saved_chapters
         progress = self.cache_manager.load_progress(ctx.cache_key)
         if not progress:
-            return False
+            # 进度文件读不出来（损坏、被删）时退回进程内记录：
+            # 否则每一章都会被判成"未落盘"，白白耗尽重试次数
+            return chapter_index in ctx.saved_chapters
         return ctx.chapters[chapter_index - 1].get_id() in progress.completed_chapters
+
+    async def _run_agent(self, prompt: str, ctx: EpubContext) -> AgentRunResult[str]:
+        """跑一次 Agent，并禁止工具并行执行
+
+        pydantic-ai 会把同一个模型响应里的多个工具调用并发执行（同步工具进
+        线程池，见 _agent_graph.py 的 should_call_sequentially 分支），而本项目
+        的工具共享同一个 EpubContext 和同一个进度文件。实测 update_glossary
+        与 save_translated_chapter 落在同一个响应里时，两个写入者交错，进度
+        文件被截成"短文档 + 旧尾巴"，此后整本书的缓存都读不出来。
+        """
+        with self.agent.sequential_tool_calls():
+            return await self.agent.run(
+                prompt, deps=ctx, usage_limits=UsageLimits(request_limit=MAX_REQUESTS)
+            )  # type: ignore
 
     async def _translate_chapter_with_retry(
         self, ctx: EpubContext, chapter_index: int
@@ -219,11 +242,9 @@ class EpubTranslator:
             logger.console(f"切分为 {chunk_count} 块")
 
             try:
-                result = await self.agent.run(
-                    self._build_chapter_task(ctx, chapter_index, chunk_count),
-                    deps=ctx,
-                    usage_limits=UsageLimits(request_limit=MAX_REQUESTS),
-                )  # type: ignore
+                result = await self._run_agent(
+                    self._build_chapter_task(ctx, chapter_index, chunk_count), ctx
+                )
             except Exception as e:
                 logger.error(
                     f"章节 {chapter_index} 第 {attempt} 次尝试抛异常 "
@@ -243,11 +264,20 @@ class EpubTranslator:
                 logger.info(f"章节 {chapter_index} 第 {attempt} 次尝试保存成功")
                 return True
 
-            logger.error(
-                f"章节 {chapter_index} run 正常结束但未落盘，"
-                f"剩余未取分块 {len(ctx.untranslated_buffer.get(chapter_index, []))}，"
-                f"缓冲区 {len(ctx.translation_buffer.get(chapter_index, ''))} 字符"
-            )
+            incomplete = ctx.incomplete_chapters.get(chapter_index)
+            if incomplete:
+                # 保存了但被判定漏译，译文已写入 book，只是不算完成
+                logger.error(
+                    f"章节 {chapter_index} 已保存但判定不完整（{incomplete}），"
+                    f"将重新翻译"
+                )
+            else:
+                pending = ctx.pending_chunks(chapter_index)
+                logger.error(
+                    f"章节 {chapter_index} run 正常结束但未落盘，"
+                    f"缺译文的块 {len(pending)}/{ctx.chunk_count(chapter_index)}，"
+                    f"已攒 {len(ctx.assembled_translation(chapter_index))} 字符"
+                )
 
         logger.json_line(
             {"event": "chapter_failed", "chapter": chapter_index, "title": title}
@@ -258,10 +288,12 @@ class EpubTranslator:
         """把章节记入失败列表"""
         if not self.cache_manager or not ctx.cache_key:
             return
-        progress = self.cache_manager.load_progress(ctx.cache_key)
-        if progress and chapter_id not in progress.failed_chapters:
-            progress.failed_chapters.append(chapter_id)
-            self.cache_manager.save_progress(ctx.cache_key, progress)
+
+        def _append(progress: TranslationProgress) -> None:
+            if chapter_id not in progress.failed_chapters:
+                progress.failed_chapters.append(chapter_id)
+
+        self.cache_manager.update_progress(ctx.cache_key, _append)
 
     def _build_chapter_task(
         self, ctx: EpubContext, chapter_index: int, chunk_count: int
@@ -281,18 +313,19 @@ class EpubTranslator:
 请翻译第 {chapter_index} 章：{title}
 
 源语言：{ctx.source_language}　目标语言：{ctx.target_language}
-本章已切分为 {chunk_count} 个待翻译分块。
+本章已切分为 {chunk_count} 个待翻译分块，块号（chunk_index）为 0~{chunk_count - 1}。
 {glossary_hint}
 ## 执行步骤
 
-重复以下循环 {chunk_count} 次，每次处理一个分块：
+重复以下循环，直到 {chunk_count} 个分块全部有译文：
 
-1. 调用 get_untranslated_content({chapter_index}) 取出一块原文
+1. 调用 get_untranslated_content({chapter_index}) 拿到一块原文，
+   返回内容里会告诉你这块的 chunk_index
 2. 翻译这一块，只翻译文本，完整保留所有 HTML 标签和属性
-3. 调用 store_translation_chunk({chapter_index}, 译文) 写入译文；
-   内容长时可拆成多次调用，工具会自动按顺序拼接
+3. 调用 store_translation_chunk({chapter_index}, chunk_index, 译文) 写入译文；
+   单块译文太长时可以用同一个 chunk_index 分几次调用，工具会按顺序追加
 
-工具返回值会告诉你还剩几块。全部取完后：
+工具返回值会告诉你还缺哪些块。全部写入后：
 
 4. 可选：发现新的人名、地名、专有名词时调用 update_glossary 记录
 5. 调用 save_translated_chapter({chapter_index}) 保存本章
@@ -301,7 +334,8 @@ class EpubTranslator:
 
 - 本次任务只处理第 {chapter_index} 章，保存成功后就结束
 - 每个分块都必须完整翻译，不要省略或概括原文内容
-- 分块只发放一次，取出后无法重新获取，务必立刻翻译并写入
+- 写入失败或译文被判定不完整时，再次 get_untranslated_content 会重新拿到同一块，
+  按工具提示补译即可，不要跳过
 - 必须通过工具调用机制操作，不要把工具调用写成文本
 """
 
@@ -328,9 +362,7 @@ class EpubTranslator:
 只处理目录，不要翻译章节正文。
 """
         try:
-            await self.agent.run(
-                prompt, deps=ctx, usage_limits=UsageLimits(request_limit=MAX_REQUESTS)
-            )  # type: ignore
+            await self._run_agent(prompt, ctx)
         except Exception as e:
             self.logger.error(f"目录翻译失败 {type(e).__name__}: {e}")
 
@@ -362,9 +394,7 @@ class EpubTranslator:
 只处理图片，不要翻译章节正文。
 """
         try:
-            await self.agent.run(
-                prompt, deps=ctx, usage_limits=UsageLimits(request_limit=MAX_REQUESTS)
-            )  # type: ignore
+            await self._run_agent(prompt, ctx)
         except Exception as e:
             self.logger.error(f"图片翻译失败 {type(e).__name__}: {e}")
 
@@ -401,7 +431,7 @@ class EpubTranslator:
                 logger.console(
                     f"   失败章节 {len(failed)} 个: {', '.join(failed[:10])}"
                 )
-            logger.console("已生成的文件中，未完成章节仍是原文")
+            logger.console("已生成的文件中，未完成章节仍是原文或译文不完整")
             logger.console("可重新运行相同命令（带 --resume）继续翻译剩余章节")
         else:
             logger.console(f"✅ 翻译完成：{completed}/{total} 章")

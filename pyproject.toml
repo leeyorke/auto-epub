@@ -1,6 +1,6 @@
 [project]
 name = "auto-epub"
-version = "1.2.0"
+version = "1.2.1"
 description = "基于 pydantic-ai 的 EPUB 电子书多语言翻译工具"
 readme = "README.md"
 requires-python = ">=3.10"

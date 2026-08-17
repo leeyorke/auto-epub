@@ -3,13 +3,18 @@ Agent 客户端 - 使用 Toolsets 方式
 """
 
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.settings import ModelSettings
 
 from .agent_tools import EpubContext, epub_toolset
 from .config import get_model_provider
-from .settings import AGENT_SYSTEM_PROMPT, ENABLE_CACHE, OUTPUT_MAX_TOKENS, TEMPERATURE
+from .settings import (
+    AGENT_SYSTEM_PROMPT,
+    ENABLE_CACHE,
+    OUTPUT_MAX_TOKENS,
+    TEMPERATURE,
+    TIMEOUT,
+)
 from .translator import EpubTranslator
 
 
@@ -30,11 +35,20 @@ def create_epub_agent(target_language: str) -> Agent[EpubContext, str]:
         provider=OpenAIProvider(
             base_url=model_provider.base_url, api_key=model_provider.api_key
         ),
-        settings=ModelSettings(
+        settings=OpenAIChatModelSettings(
             temperature=TEMPERATURE,
+            # pydantic-ai 把 max_tokens 发成 max_completion_tokens
             max_tokens=OUTPUT_MAX_TOKENS,
-            # deepseek需要关闭思考模式，如启用，需要回传content
-            extra_body={"thinking": {"type": "disabled"}},
+            # 设置最低思考强度加快翻译速度
+            openai_reasoning_effort="low",
+            extra_body={
+                # deepseek需要关闭思考模式，如启用，需要回传content
+                "thinking": {"type": "disabled"},
+                # 只认 max_tokens 的供应商（如 stepfun）走这条；
+                # 两个字段都发出去，谁认哪个都能生效
+                "max_tokens": OUTPUT_MAX_TOKENS,
+            },
+            timeout=TIMEOUT,
         ),
     )
 
