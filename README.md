@@ -142,7 +142,7 @@ Python 负责编排，Agent 只在"翻译一个章节"这一粒度上工作—�
 
 - 分块器递归下钻：整章被单个 `<section>` 包裹时也能切开，且所有分块拼接后与原 body 内容完全一致
 - `INPUT_MAX_TOKENS` 必须显著小于 `OUTPUT_MAX_TOKENS`：译文 + HTML 标签 + JSON 转义叠加后，输出通常是输入的 1.5~2 倍
-- 保存前比对译文与原文的 HTML 标签数，低于 `MIN_TAG_RATIO` 判定漏译并要求补译；第二次仍不达标则放行并告警
+- 保存前比对译文与原文的 HTML 标签数：**块级**标签（`p`/`div`/`h*`/`li`…）低于 `MIN_BLOCK_TAG_RATIO` 判定漏译，该块会被作废重发一次，全章不达标则本章不算完成、下次 `--resume` 重译；**内联**标签（`a`/`em`/`span`…）低于 `MIN_INLINE_TAG_RATIO` 只告警，不阻塞保存
 
 ### 缓存机制
 
@@ -176,7 +176,8 @@ INPUT_MAX_TOKENS = 2500   # 单个待翻译分块的 token 上限
 TEMPERATURE = 0.1         # 温度（越低越稳定）
 MAX_REQUESTS = 60         # 单章 Agent run 的最大 API 请求数
 MAX_CHAPTER_RETRIES = 2   # 单章翻译失败后的重试次数
-MIN_TAG_RATIO = 0.8       # 译文/原文 HTML 标签数的最低比例，低于此值判定漏译
+MIN_BLOCK_TAG_RATIO = 0.8   # 块级标签比例下限，低于此判定漏译（硬指标）
+MIN_INLINE_TAG_RATIO = 0.8  # 内联标签比例下限，低于此只告警，不阻塞保存
 
 # 功能开关
 TRANSLATE_IMAGES = False  # 是否翻译图片

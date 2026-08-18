@@ -67,19 +67,23 @@ EPUB 文件
 ```
 translator._translate_chapter_with_retry() (translator.py)
   ↓
-ctx.prepare_chapter(n)         # Python 侧切分，填充 untranslated_buffer
+ctx.prepare_chapter(n)         # Python 侧切分，填充 chapter_chunks 并重置该章状态
   ↓
 agent.run(单章提示词, deps=ctx)
   ├─ get_untranslated_content (agent_tools.py)
-  │    └─ EpubTools.split_html_content 的结果早已就绪，这里只出队
-  ├─ store_translation_chunk   # 追加进 translation_buffer
+  │    ├─ 非破坏性发放：返回第一个 chunk_translations 里还没有译文的块
+  │    └─ 都有译文时 → take_reissue_chunk：作废一个块级标签不达标的块的译文，
+  │       重发它的原文（每块一次，chunk_reissued 记账）
+  ├─ store_translation_chunk   # 按 chunk_index 写进 chunk_translations，同块追加
+  │    └─ 校验该块块级标签比例 ≥ MIN_BLOCK_TAG_RATIO，内联不足只点名
   ├─ update_glossary           # 写 glossary + 同步缓存进度
   └─ save_translated_chapter
-       ├─ 校验 1：untranslated_buffer 是否取空
-       ├─ 校验 2：译文/原文标签数 ≥ MIN_TAG_RATIO
-       ├─ chapter.set_content()          # 写回 book 对象
+       ├─ 校验 1：pending_chunks 是否为空（有块没译文就硬拦）
+       ├─ 校验 2：全章块级标签比例 ≥ MIN_BLOCK_TAG_RATIO
+       ├─ chapter.set_content()          # 写回 book 对象（判定不完整也写）
        ├─ cache_manager.save_chapter()   # 落盘缓存
-       └─ cache_manager.save_progress()  # 更新 completed_chapters
+       ├─ cache_manager.save_progress()  # 更新 completed_chapters（仅完整时）
+       └─ finished_chapters.add(n)       # 此后本章所有章节级工具只回收尾指令
 ```
 
 ### 翻译目录
@@ -129,16 +133,16 @@ auto-epub/
 | 文件 | 行数 | 说明 |
 |------|------|------|
 | config.py | 25 | 配置加载 |
-| __init__.py | 31 | 包初始化 |
-| models.py | 50 | 数据模型 |
-| client.py | 66 | Agent 工厂 |
-| settings.py | 72 | 常量 + 提示词 |
-| cache_manager.py | 89 | 缓存管理 |
+| __init__.py | 34 | 包初始化 |
+| models.py | 54 | 数据模型 |
+| client.py | 80 | Agent 工厂 |
+| settings.py | 88 | 常量 + 提示词 |
 | concurrent_manager.py | 120 | 并发控制（未使用） |
-| cli.py | 126 | 命令行接口 |
-| logger.py | 177 | 诊断日志 |
-| epub_tools.py | 263 | EPUB 底层工具 |
-| translator.py | 413 | 翻译编排器 |
-| agent_tools.py | 717 | 工具集 + 上下文 |
+| cli.py | 174 | 命令行接口 |
+| cache_manager.py | 176 | 缓存管理 |
+| epub_tools.py | 264 | EPUB 底层工具 |
+| logger.py | 326 | 诊断日志 |
+| translator.py | 447 | 翻译编排器 |
+| agent_tools.py | 1155 | 工具集 + 上下文 |
 
-总计约 2100 行。
+总计约 2900 行。

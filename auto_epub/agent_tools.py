@@ -4,6 +4,7 @@ EPUB 翻译工具集 - 使用 Toolsets 方式
 
 import base64
 import re
+from collections import Counter
 from typing import Dict, List, Optional, Set
 
 from ebooklib import epub
@@ -14,9 +15,53 @@ from .cache_manager import CacheManager
 from .epub_tools import EpubTools
 from .logger import ConsoleLevel, get_logger
 from .models import TranslationProgress
-from .settings import MIN_TAG_RATIO, TRANSLATE_IMAGES
+from .settings import MIN_BLOCK_TAG_RATIO, MIN_INLINE_TAG_RATIO, TRANSLATE_IMAGES
 
-_TAG_RE = re.compile(r"<[a-zA-Z/][^>]*>")
+# 捕获标签名，以便按块级 / 内联分别计数。
+# 匹配集合必须与旧的 `<[a-zA-Z/][^>]*>` 完全一致（都要求闭合 `>`、都同时数开
+# 标签与闭标签、都不匹配 `<!--` 和 `<?xml`），否则历史日志里的 tags 就不可比了。
+_TAG_NAME_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*>")
+
+# 块级标签：与段落一一对应，少一个就是真的少一段内容，是漏译判定的硬指标。
+# img 也算块级——丢一张图同样是内容缺失。
+# 其余（a/em/span/strong/br/i/b/sub/sup/code/small/cite/q/abbr…）视为内联，
+# 模型系统性地会吞掉它们，丢了只影响排版细节，不阻塞保存。
+_BLOCK_TAGS = frozenset(
+    {
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ul",
+        "ol",
+        "dl",
+        "dt",
+        "dd",
+        "blockquote",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "td",
+        "th",
+        "section",
+        "article",
+        "aside",
+        "header",
+        "footer",
+        "figure",
+        "figcaption",
+        "pre",
+        "hr",
+        "img",
+    }
+)
 
 
 def collect_toc_titles(toc_items) -> List[str]:
@@ -55,13 +100,40 @@ def apply_toc_titles(toc_items, titles_iter):
     return updated
 
 
-def _count_tags(html: str) -> int:
-    """统计 HTML 标签数量。
+def _count_tags(html: str, *, block_only: bool = False) -> int:
+    """统计 HTML 标签数量（开标签与闭标签都算）。
 
     译文要求原样保留标签，因此标签数是比字符数更可靠的完整性信号：
     中文译文字符数天然比英文原文少一半左右，用字符数判断会大量误报。
+
+    Args:
+        block_only: 只数块级标签（见 _BLOCK_TAGS）。漏译的硬判定用这个口径——
+            全标签口径会把"内联标签被吞"误判成"整段没译"。
     """
-    return len(_TAG_RE.findall(html))
+    tags = _TAG_NAME_RE.findall(html)
+    if not block_only:
+        return len(tags)
+    return sum(1 for _, name in tags if name.lower() in _BLOCK_TAGS)
+
+
+def _missing_tag_names(source: str, translated: str) -> Dict[str, int]:
+    """返回译文相比原文少掉的标签 {标签名: 少几个}，按缺失数降序。
+
+    只比开标签：闭标签是镜像，两种都数会让数字翻倍、把提示语搞糊。
+    """
+
+    def opening(html: str) -> Counter:
+        return Counter(
+            name.lower() for slash, name in _TAG_NAME_RE.findall(html) if not slash
+        )
+
+    missing = opening(source) - opening(translated)
+    return dict(missing.most_common())
+
+
+def _describe_missing(missing: Dict[str, int]) -> str:
+    """把 {标签名: 少几个} 写成"5 个 <a>、2 个 <em>"，供提示语点名"""
+    return "、".join(f"{count} 个 <{name}>" for name, count in missing.items())
 
 
 def _out_of_scope(tool: str, chapter_index: int) -> str:
@@ -73,6 +145,24 @@ def _out_of_scope(tool: str, chapter_index: int) -> str:
     reason = f"章节 {chapter_index} 不在本次任务范围内"
     get_logger().tool_error(tool, reason)
     return f"错误：{reason}"
+
+
+def _already_finished(tool: str, chapter_index: int) -> str:
+    """本章已经保存过之后，所有章节级工具的统一回答
+
+    实测死锁：章节 5 保存被判漏译后返回"本次任务到此结束"，而
+    get_untranslated_content / check_chapter_progress 同时在说"都已完成，
+    请调用 save_translated_chapter"——三个工具互相打脸，又没有一个合法的收尾
+    动作，模型就在唯一"安全"的工具上转圈，把 request_limit 烧满（约 4 分钟）。
+    保存之后必须让每个章节级工具都只说同一句话，模型才停得下来。
+    """
+    reason = f"章节 {chapter_index} 本次已保存过，工具调用被忽略"
+    get_logger().tool_error(tool, reason)
+    return (
+        f"章节 {chapter_index} 本次任务已经结束（已经调用过 "
+        f"save_translated_chapter）。请不要再调用任何章节工具，"
+        f"直接用一句话说明本章处理情况即可。"
+    )
 
 
 class EpubContext:
@@ -105,6 +195,13 @@ class EpubContext:
         # 已就"疑似漏译"提醒过的块 {章节索引: {块号}}，
         # 同一块只提醒一次，避免模型卡在补译-拒绝循环里
         self.chunk_warned: Dict[int, Set[int]] = {}
+        # 已因块级标签不达标被作废重发过的块 {章节索引: {块号}}。每块只给一次
+        # 机会：store 是追加语义，反复重发会把译文越攒越乱；一次重译仍不达标
+        # 说明模型解决不了，该退回章节级重试（prepare_chapter 会整章从头来）。
+        self.chunk_reissued: Dict[int, Set[int]] = {}
+        # 本次 run 里已经走完 save_translated_chapter 的章节（不论判定完整与否）。
+        # 保存之后所有章节级工具都只回一句收尾指令，见 _already_finished。
+        self.finished_chapters: Set[int] = set()
         # 保存成功（且完整）的章节索引，未启用缓存时用它判断落盘情况
         self.saved_chapters: Set[int] = set()
         # 保存了但判定不完整的章节 {章节索引: 原因}，供编排层如实报告
@@ -131,19 +228,62 @@ class EpubContext:
             stored.get(i, "") for i in range(self.chunk_count(chapter_index))
         )
 
-    def source_tag_count(self, chapter_index: int) -> int:
+    def source_tag_count(self, chapter_index: int, *, block_only: bool = False) -> int:
         """全章原文的标签数（由分块实时统计，不额外维护一份状态）"""
-        return sum(_count_tags(c) for c in self.chapter_chunks.get(chapter_index, []))
+        return sum(
+            _count_tags(c, block_only=block_only)
+            for c in self.chapter_chunks.get(chapter_index, [])
+        )
 
     def thin_chunks(self, chapter_index: int) -> List[int]:
-        """返回译文标签数明显少于原文的块号——疑似块内漏译"""
+        """返回块级标签数明显少于原文的块号——真漏译（会触发重发和硬拦）
+
+        只看块级标签：内联标签（脚注 <a>、<em> 等）被模型吞掉不影响正文完整性，
+        按全标签口径算会把"完整译完"的块误判成漏译。
+        """
         stored = self.chunk_translations.get(chapter_index, {})
         thin = []
         for i, source in enumerate(self.chapter_chunks.get(chapter_index, [])):
-            expected = _count_tags(source)
-            if expected and _count_tags(stored.get(i, "")) < expected * MIN_TAG_RATIO:
+            expected = _count_tags(source, block_only=True)
+            actual = _count_tags(stored.get(i, ""), block_only=True)
+            if expected and actual < expected * MIN_BLOCK_TAG_RATIO:
                 thin.append(i)
         return thin
+
+    def reissuable_chunks(self, chapter_index: int) -> List[int]:
+        """已有译文、但块级标签不达标、且还没用掉重译机会的块号（升序）
+
+        三个工具（get_untranslated_content / store_translation_chunk /
+        check_chapter_progress）都用它给出同一个下一步，避免"这个说可以保存了、
+        那个说还得重译"的互相打脸。它随 chunk_reissued 单调收缩，引导必然收敛。
+        必须排除"完全没有译文"的块：那种块归 pending_chunks 管、会被正常发放，
+        而 thin_chunks 把 0 个标签也算作不达标，算进来会白白吃掉它的重译额度。
+        """
+        done = self.chunk_reissued.get(chapter_index, set())
+        stored = self.chunk_translations.get(chapter_index, {})
+        return [
+            i
+            for i in self.thin_chunks(chapter_index)
+            if i not in done and stored.get(i, "").strip()
+        ]
+
+    def take_reissue_chunk(self, chapter_index: int) -> Optional[int]:
+        """作废一个块级标签不达标的块的译文，返回它的块号供重新发放。
+
+        只清译文，不动 chapter_chunks——"分块发放必须非破坏性"这条不变量说的是
+        原文分块在整个 run 里只读、永不消失，这里满足。
+        每块最多作废一次（chunk_reissued 记账），理由见该字段注释。
+
+        Returns:
+            可以重发的块号；没有需要重发的块时返回 None
+        """
+        for i in self.reissuable_chunks(chapter_index):
+            self.chunk_reissued.setdefault(chapter_index, set()).add(i)
+            self.chunk_translations.get(chapter_index, {}).pop(i, None)
+            # 不清 chunk_warned：store 时的补译提醒已经发过一次，重发时的发放
+            # 提示比它更明确，再提醒一次容易把模型推回"追加补译"模式。
+            return i
+        return None
 
     def prepare_chapter(self, chapter_index: int) -> int:
         """切分章节内容并重置该章状态，返回分块数。
@@ -157,6 +297,8 @@ class EpubContext:
         self.chapter_chunks[chapter_index] = []
         self.chunk_translations[chapter_index] = {}
         self.chunk_warned[chapter_index] = set()
+        self.chunk_reissued[chapter_index] = set()
+        self.finished_chapters.discard(chapter_index)
         self.incomplete_chapters.pop(chapter_index, None)
 
         chapter = self.chapters[chapter_index - 1]
@@ -192,6 +334,8 @@ class EpubContext:
         self.chapter_chunks.pop(chapter_index, None)
         self.chunk_translations.pop(chapter_index, None)
         self.chunk_warned.pop(chapter_index, None)
+        self.chunk_reissued.pop(chapter_index, None)
+        self.finished_chapters.discard(chapter_index)
         self.incomplete_chapters.pop(chapter_index, None)
 
 
@@ -274,9 +418,25 @@ def check_chapter_progress(ctx: RunContext[EpubContext], chapter_index: int) -> 
     total = ctx.deps.chunk_count(chapter_index)
     if total == 0:
         return _out_of_scope("check_chapter_progress", chapter_index)
+    if chapter_index in ctx.deps.finished_chapters:
+        return _already_finished("check_chapter_progress", chapter_index)
 
     pending = ctx.deps.pending_chunks(chapter_index)
     if not pending:
+        reissuable = ctx.deps.reissuable_chunks(chapter_index)
+        if reissuable:
+            # 与 store_translation_chunk 的收尾口径保持一致：一个说"可以保存"、
+            # 另一个说"还得重译"，模型就会在两者之间转圈
+            logger.tool_call(
+                "check_chapter_progress",
+                f"章节 {chapter_index} 的块 {reissuable} 漏掉整段内容，需重译",
+            )
+            return (
+                f"章节 {chapter_index} 的 {total} 个分块都有译文，但块 {reissuable} "
+                f"漏掉了整段内容（块级 HTML 标签明显少于原文）。"
+                f"请调用 get_untranslated_content({chapter_index}) 重新拿到原文，"
+                f"完整重译后再保存。"
+            )
         logger.console(f"章节{chapter_index}的所有内容片段已全部翻译完成")
         logger.tool_call(
             "check_chapter_progress", f"章节 {chapter_index} 的 {total} 块均已有译文"
@@ -301,8 +461,9 @@ def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -
     """
     获取指定章节中下一个还没有译文的 HTML 分块
 
-    每次调用返回一块，翻译后必须用 store_translation_chunk 连同块号写回，
-    写回成功才算完成；否则再次调用本工具会重新拿到同一块。
+    每次调用返回一块，翻译后必须用 store_translation_chunk 连同块号写回。
+    写回成功的块不会再发放；只有块级标签明显缺失（整段没译）的块才会被作废
+    并重新发放一次原文，此时返回内容里会写明"原有译文已作废"。
     重复调用直到该章节所有分块都有译文。
 
     Args:
@@ -315,8 +476,17 @@ def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -
     total = ctx.deps.chunk_count(chapter_index)
     if total == 0:
         return _out_of_scope("get_untranslated_content", chapter_index)
+    if chapter_index in ctx.deps.finished_chapters:
+        return _already_finished("get_untranslated_content", chapter_index)
 
     pending = ctx.deps.pending_chunks(chapter_index)
+    if not pending:
+        # 没有"完全没译文"的块了，再看有没有块级标签缺失的块需要作废重译。
+        # 少了这一步，store 时那句"请补译"就是空头承诺——模型永远拿不回原文。
+        reissued = ctx.deps.take_reissue_chunk(chapter_index)
+        if reissued is not None:
+            logger.info(f"章节 {chapter_index} 作废并重发块 {reissued}（块级标签不足）")
+            pending = ctx.deps.pending_chunks(chapter_index)
     if not pending:
         logger.console(f"章节{chapter_index}的所有内容片段已全部翻译完成")
         logger.tool_call(
@@ -335,6 +505,19 @@ def get_untranslated_content(ctx: RunContext[EpubContext], chapter_index: int) -
         f"章节 {chapter_index} 发放块 {index}: tokens={EpubTools.count_tokens(chunk)} "
         f"chars={len(chunk)} tags={_count_tags(chunk)}，本章尚缺 {remaining} 块"
     )
+
+    # 按记账判断而不是按本次调用的返回值：模型可能连续调两次本工具才去翻译，
+    # 那时 take_reissue_chunk 已经不会再触发，但这块仍然需要整块重译。
+    if index in ctx.deps.chunk_reissued.get(chapter_index, ()):
+        # 重发的块：原有译文已经被清掉，必须整块重译而不是追加补译
+        hint = (
+            f"这是块 chunk_index={index}，它先前的译文因为漏掉了整段内容已被作废。"
+            f"请**重新完整翻译整块**（不是只补一部分），"
+            f"保留每一个 HTML 标签和属性，"
+            f"然后调用 store_translation_chunk({chapter_index}, {index}, 译文) 写入。"
+            f"本块只有这一次重译机会。"
+        )
+        return f"{chunk}\n\n---\n[系统提示] {hint}"
 
     hint = (
         f"这是第 {index + 1}/{total} 块，chunk_index={index}。"
@@ -374,6 +557,8 @@ def store_translation_chunk(
     total = ctx.deps.chunk_count(chapter_index)
     if total == 0:
         return _out_of_scope("store_translation_chunk", chapter_index)
+    if chapter_index in ctx.deps.finished_chapters:
+        return _already_finished("store_translation_chunk", chapter_index)
 
     if chunk_index < 0 or chunk_index >= total:
         pending = ctx.deps.pending_chunks(chapter_index)
@@ -399,37 +584,58 @@ def store_translation_chunk(
     stored[chunk_index] = stored.get(chunk_index, "") + translated_html
 
     source_chunk = ctx.deps.chapter_chunks[chapter_index][chunk_index]
+    translation = stored[chunk_index]
     expected_tags = _count_tags(source_chunk)
-    actual_tags = _count_tags(stored[chunk_index])
+    actual_tags = _count_tags(translation)
+    expected_block = _count_tags(source_chunk, block_only=True)
+    actual_block = _count_tags(translation, block_only=True)
+    expected_inline = expected_tags - expected_block
+    actual_inline = actual_tags - actual_block
     pending = ctx.deps.pending_chunks(chapter_index)
 
     logger.info(
         f"章节 {chapter_index} 写入块 {chunk_index}: chars={len(translated_html)} "
-        f"tags={actual_tags}/{expected_tags}"
+        f"tags={actual_tags}/{expected_tags} block={actual_block}/{expected_block} "
+        f"inline={actual_inline}/{expected_inline}"
         f"{'（追加）' if appended else ''}，本章尚缺 {len(pending)} 块"
     )
 
-    # 完整性校验放在写入时刻：此时模型手里还有这块原文，能直接补译；
-    # 等到 save 时才发现漏译，模型已经不知道漏的是哪一段了。
+    missing = _missing_tag_names(source_chunk, translation)
+    counts = (
+        f"块级标签 {actual_block}/{expected_block}、"
+        f"全部标签 {actual_tags}/{expected_tags}"
+    )
+
+    # 漏译判定只看块级标签：块级标签与段落一一对应，少一个就是真的少一段；
+    # 内联标签（脚注 <a>、<em> 等）被模型吞掉正文却一字不缺，按全标签口径算会
+    # 把完整译完的块误判成漏译（实测第 5 章 49/63 被误杀并卡死整章）。
     warned = ctx.deps.chunk_warned.setdefault(chapter_index, set())
-    if expected_tags and actual_tags < expected_tags * MIN_TAG_RATIO:
+    if expected_block and actual_block < expected_block * MIN_BLOCK_TAG_RATIO:
+        # 校验放在写入时刻：此时模型手里还有这块原文，能直接补译；
+        # 等到 save 才发现漏译，模型已经不知道漏的是哪一段了。
         if chunk_index not in warned:
-            # 同一块只提醒一次，避免模型卡在补译-拒绝的死循环里
+            # 同一块只提醒一次，避免模型卡在补译-拒绝的死循环里。模型若置之不
+            # 理，本章末尾 get_untranslated_content 会作废这块译文重新发放原文。
             warned.add(chunk_index)
+            block_missing = _describe_missing(
+                {k: v for k, v in missing.items() if k in _BLOCK_TAGS}
+            )
             logger.incomplete(
                 chapter_index,
-                f"块 {chunk_index} 标签数 {actual_tags}/{expected_tags}，要求补译",
+                f"块 {chunk_index} 块级标签 {actual_block}/{expected_block}，要求补译",
             )
             return (
-                f"⚠️ 块 {chunk_index} 的译文已存入，但只有 {actual_tags} 个 HTML 标签，"
-                f"原文有 {expected_tags} 个，说明有内容没译到。"
+                f"⚠️ 块 {chunk_index} 的译文已存入，但只有 {actual_block} 个块级 HTML "
+                f"标签，原文有 {expected_block} 个"
+                + (f"（少了 {block_missing}）" if block_missing else "")
+                + "，说明有整段内容没译到。"
                 f"请只把遗漏的那部分补译出来，再次调用 "
                 f"store_translation_chunk({chapter_index}, {chunk_index}, 补译内容)"
                 f"追加进去（会自动拼到已有译文后面），不要重复已译内容。"
             )
         logger.console(
-            f"⚠️  章节 {chapter_index} 块 {chunk_index} 译文偏短："
-            f"标签数 {actual_tags}/{expected_tags}，已放行",
+            f"⚠️  章节 {chapter_index} 块 {chunk_index} 块级标签仍不足："
+            f"{actual_block}/{expected_block}，已放行（本章末尾会重发此块）",
             ConsoleLevel.VERBOSE,
         )
     elif expected_tags and actual_tags > expected_tags * 1.5:
@@ -439,16 +645,46 @@ def store_translation_chunk(
             f"{actual_tags}/{expected_tags}，注意块号是否写错"
         )
 
+    # 内联标签不足只提醒、不阻塞：正文完整，重译一遍大概率还是同样吞标签，
+    # 拦下来只会白烧重试次数。点名少了哪些标签，让模型在后面的块里注意。
+    inline_note = ""
+    if expected_inline and actual_inline < expected_inline * MIN_INLINE_TAG_RATIO:
+        inline_missing = _describe_missing(
+            {k: v for k, v in missing.items() if k not in _BLOCK_TAGS}
+        )
+        logger.info(
+            f"章节 {chapter_index} 块 {chunk_index} 内联标签 "
+            f"{actual_inline}/{expected_inline}"
+            + (f"，少了 {inline_missing}" if inline_missing else "")
+        )
+        inline_note = (
+            f"（注意：内联标签只剩 {actual_inline}/{expected_inline}"
+            + (f"，少了 {inline_missing}" if inline_missing else "")
+            + "，正文完整所以不影响保存，后面的块请把这类标签原样保留）"
+        )
+
     if pending:
         return (
-            f"✓ 已存入章节 {chapter_index} 的块 {chunk_index}"
-            f"（标签数 {actual_tags}/{expected_tags}）。"
+            f"✓ 已存入章节 {chapter_index} 的块 {chunk_index}（{counts}）。"
+            f"{inline_note}"
             f"本章还缺 {len(pending)} 块，块号 {pending}，"
             f"请继续调用 get_untranslated_content。"
         )
+    reissuable = ctx.deps.reissuable_chunks(chapter_index)
+    if reissuable:
+        # 这里是能低成本挽回的最后一刻：模型一旦去保存，save 会判全章漏译、
+        # 整章退回重译（save 只有"完整"和"不完整"两个终点，不设重译拒绝路径，
+        # 理由见 ARCHITECTURE.md「完整性判定」）。重译一块比重译一章便宜得多。
+        return (
+            f"✓ 已存入章节 {chapter_index} 的块 {chunk_index}（{counts}）。"
+            f"{inline_note}"
+            f"本章 {total} 个分块都有译文了，但块 {reissuable} 漏掉了整段内容，"
+            f"请调用 get_untranslated_content({chapter_index}) 重新拿到原文完整重译，"
+            f"之后再保存。"
+        )
     return (
-        f"✓ 已存入章节 {chapter_index} 的块 {chunk_index}"
-        f"（标签数 {actual_tags}/{expected_tags}）。"
+        f"✓ 已存入章节 {chapter_index} 的块 {chunk_index}（{counts}）。"
+        f"{inline_note}"
         f"本章 {total} 个分块都有译文了，可以调用 save_translated_chapter 保存。"
     )
 
@@ -460,6 +696,7 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
 
     把之前通过 store_translation_chunk 写入的各块译文按块号顺序拼接，存入 EPUB。
     调用前该章节的每一个分块都必须有译文。
+    每章只能成功调用一次：调用之后本章所有工具都不再接受调用。
 
     Args:
         chapter_index: 章节索引（从 1 开始）
@@ -470,9 +707,12 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
     total = ctx.deps.chunk_count(chapter_index)
     if total == 0:
         return _out_of_scope("save_translated_chapter", chapter_index)
+    if chapter_index in ctx.deps.finished_chapters:
+        return _already_finished("save_translated_chapter", chapter_index)
 
     # 护栏：只要有块没译文就不许保存。分块可以反复获取，模型总能补上，
     # 因此这里不设放行次数——放行等于把漏译静默写进成品。
+    # 这条拒绝不登记 finished_chapters：它正是要让模型继续干活。
     pending = ctx.deps.pending_chunks(chapter_index)
     if pending:
         get_logger().rejection(
@@ -495,12 +735,19 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
 
     translated_html = ctx.deps.assembled_translation(chapter_index)
 
-    # 全章标签数复查：逐块校验已经在 store 时做过，这里兜住"每块都略微偏少、
-    # 累积起来缺一大截"的情况。用标签数而非字符数：中文译文字符数天然比英文
-    # 少一半左右，按字符判断会大量误报。
+    # 全章复查：逐块校验已经在 store 时做过，这里兜住"每块都略微偏少、累积起来
+    # 缺一大截"的情况。判定只用块级标签——全标签口径会把"内联标签被吞"误判成
+    # "整段没译"（实测第 5 章正文一字没漏，只丢 5 个 <a> 和 2 个 <em>，
+    # 全标签 49/63=77.8% 就被判漏译，随后卡死在工具互相打脸的死循环里）。
     source_tags = ctx.deps.source_tag_count(chapter_index)
     actual_tags = _count_tags(translated_html)
-    tags_missing = source_tags > 0 and actual_tags < source_tags * MIN_TAG_RATIO
+    source_block = ctx.deps.source_tag_count(chapter_index, block_only=True)
+    actual_block = _count_tags(translated_html, block_only=True)
+    tags_missing = (
+        source_block > 0 and actual_block < source_block * MIN_BLOCK_TAG_RATIO
+    )
+    source_inline = source_tags - source_block
+    actual_inline = actual_tags - actual_block
     thin = ctx.deps.thin_chunks(chapter_index)
 
     logger = get_logger()
@@ -510,21 +757,34 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
             "event": "save_chapter",
             "chapter": chapter_index,
             "chars": len(translated_html),
+            # tags / source_tags 保持全标签口径不变，便于与历史日志对比
             "tags": actual_tags,
             "source_tags": source_tags,
+            "block_tags": actual_block,
+            "source_block_tags": source_block,
+            "inline_tags": actual_inline,
+            "source_inline_tags": source_inline,
             "tags_missing": tags_missing,
             "chunks": total,
             "thin_chunks": thin,
+            "reissued_chunks": sorted(ctx.deps.chunk_reissued.get(chapter_index, ())),
         }
     )
     if thin:
         logger.console(
-            f"⚠️  章节 {chapter_index} 有 {len(thin)} 块译文偏短：块号 {thin}",
+            f"⚠️  章节 {chapter_index} 有 {len(thin)} 块块级标签偏少：块号 {thin}",
+            ConsoleLevel.VERBOSE,
+        )
+    if source_inline and actual_inline < source_inline * MIN_INLINE_TAG_RATIO:
+        # 内联标签不足不阻塞保存，但要留痕：脚注链接、强调这类排版细节确实丢了
+        logger.console(
+            f"⚠️  章节 {chapter_index} 内联标签 {actual_inline}/{source_inline}"
+            f"，正文完整，不影响保存",
             ConsoleLevel.VERBOSE,
         )
     if tags_missing:
         logger.incomplete(
-            chapter_index, f"全章标签数 {actual_tags}/{source_tags}，判定漏译"
+            chapter_index, f"全章块级标签 {actual_block}/{source_block}，判定漏译"
         )
         logger.dump_buffer(chapter_index, translated_html)
 
@@ -537,13 +797,17 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
             ctx.deps.cache_key, chapter_id, translated_html
         )
 
+    # 走到这里本章就算处理完了（不论完整与否）：之后任何章节级工具都只回一句
+    # 收尾指令，模型才有唯一一致的出口，不会在"已完成/别再保存"之间转圈。
+    ctx.deps.finished_chapters.add(chapter_index)
+
     if tags_missing:
-        reason = f"全章标签数 {actual_tags}/{source_tags}"
+        reason = f"全章块级标签 {actual_block}/{source_block}"
         ctx.deps.incomplete_chapters[chapter_index] = reason
         return (
-            f"章节 {chapter_index} 的译文已写入，但全章只有 {actual_tags} 个 HTML "
-            f"标签，原文有 {source_tags} 个，判定为漏译，本章不算完成。"
-            f"请不要再重复保存，本次任务到此结束。"
+            f"章节 {chapter_index} 的译文已写入，但全章只有 {actual_block} 个块级 "
+            f"HTML 标签，原文有 {source_block} 个，判定为漏译，本章不算完成。"
+            f"本次任务到此结束，请不要再调用任何工具，直接用一句话说明情况。"
         )
 
     ctx.deps.saved_chapters.add(chapter_index)
@@ -558,7 +822,10 @@ def save_translated_chapter(ctx: RunContext[EpubContext], chapter_index: int) ->
 
         ctx.deps.cache_manager.update_progress(ctx.deps.cache_key, _mark_done)
 
-    return f"✓ 已保存章节 {chapter_index}: {chapter.get_name()}"
+    return (
+        f"✓ 已保存章节 {chapter_index}: {chapter.get_name()}。"
+        f"本章任务结束，不要再调用章节工具。"
+    )
 
 
 @epub_toolset.tool

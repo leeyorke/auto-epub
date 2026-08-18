@@ -118,6 +118,8 @@ get_untranslated_content(n)  → 翻译该块 → store_translation_chunk(n, chu
 
 `retries=3`（client.py）同时是 pydantic-ai 的 `_max_tool_retries` 和 `_max_result_retries`；`MAX_REQUESTS` 限制单次 run 的 API 请求数，是模型陷入死循环时唯一的刹车（原因见"工具错误不计重试"）。
 
+这个循环有两个岔路，都在"完整性判定"里详述：某块漏了整段内容时，`get_untranslated_content` 会作废它的译文并重发原文（每块一次）；`save_translated_chapter` 一旦返回，本章所有章节级工具就只回同一句收尾指令，run 才有唯一的出口。
+
 ### 3. Toolsets（工具层）
 
 **设计原则：**
@@ -137,9 +139,10 @@ list_images()                  # 图片列表
 
 **翻译操作类：**
 ```python
-get_untranslated_content()  # 发放下一个还没有译文的块（非破坏性，不弹出）
+get_untranslated_content()  # 发放下一个还没有译文的块（非破坏性，不弹出）；
+                            # 没有这种块时，作废一个漏了整段的块并重发它的原文
 store_translation_chunk()   # 按 chunk_index 写入译文，同块多次调用则追加
-save_translated_chapter()   # 保存本章，含护栏
+save_translated_chapter()   # 保存本章，含护栏；调用后本章所有工具即闭嘴
 update_glossary()           # 更新术语表
 translate_toc()             # 列出目录项
 save_translated_toc()       # 保存目录，并同步 nav.xhtml
@@ -171,13 +174,15 @@ class EpubContext:
     chapter_chunks: Dict[int, List[str]]           # 各章原文分块（翻译期间只读）
     chunk_translations: Dict[int, Dict[int, str]]  # {章节: {块号: 译文}}
     chunk_warned: Dict[int, Set[int]]              # 已提醒过"疑似漏译"的块
+    chunk_reissued: Dict[int, Set[int]]            # 已作废重发过的块（每块一次）
     saved_chapters: Set[int]                       # 完整保存成功的章节
     incomplete_chapters: Dict[int, str]            # 保存了但判定不完整 {章节: 原因}
+    finished_chapters: Set[int]                    # 本次 run 已走完 save 的章节
 ```
 
-派生状态一律由方法实时计算，不额外维护副本：`chunk_count` / `pending_chunks`（缺译文的块号）/ `assembled_translation`（按块号排序拼接）/ `source_tag_count` / `thin_chunks`（译文偏短的块号）。
+派生状态一律由方法实时计算，不额外维护副本：`chunk_count` / `pending_chunks`（缺译文的块号）/ `assembled_translation`（按块号排序拼接）/ `source_tag_count`（可选 `block_only`）/ `thin_chunks`（块级标签不达标的块号）/ `reissuable_chunks`（还没用掉重译机会的 `thin_chunks`）。唯一有副作用的是 `take_reissue_chunk`——它作废一个块的译文并记账。
 
-关键方法 `prepare_chapter(index)`：切分章节、重置该章所有中间状态、记录分块尺寸到日志，返回分块数。**它是普通方法，不是 Agent 工具**——见下节。
+关键方法 `prepare_chapter(index)`：切分章节、重置该章所有中间状态（含 `chunk_reissued` 与 `finished_chapters`）、记录分块尺寸到日志，返回分块数。**它是普通方法，不是 Agent 工具**——见下节。
 
 ## 关键设计决策与不变量
 
@@ -190,7 +195,7 @@ class EpubContext:
 
 **【不变量】分块发放必须是非破坏性的。**
 `get_untranslated_content` 只"发放下一个还没有译文的块"，不弹出；`store_translation_chunk` 必须带 `chunk_index`，写入哪一块由块号决定，译文按块号排序拼接（模型乱序写入也能还原）。
-早期版本用 `pending.pop(0)` 队列，一旦某块的 store 调用被输出截断，这块原文就永久消失了——模型只能跳过它继续下一块（静默漏译），或者整章重来。日志实测一次运行里 3 个章节各丢 1 块，而全章标签比例仍在 86% 以上，`MIN_TAG_RATIO` 结构上抓不住这种 1/10 的丢失。
+早期版本用 `pending.pop(0)` 队列，一旦某块的 store 调用被输出截断，这块原文就永久消失了——模型只能跳过它继续下一块（静默漏译），或者整章重来。日志实测一次运行里 3 个章节各丢 1 块，而全章标签比例仍在 86% 以上，比例型指标结构上抓不住这种 1/10 的丢失（换成 `MIN_BLOCK_TAG_RATIO` 也一样：丢 1/10 块只掉到 90%）。
 
 **分块器必须能下钻单根元素。**
 `EpubTools._atomize` 递归拆分：超过 `INPUT_MAX_TOKENS` 的元素先产出起始标签、递归处理内部、再补结束标签。
@@ -220,15 +225,40 @@ pydantic-ai 在 `_agent_graph.py` 里对一个响应内的多个 tool call 走 `
 
 ### 完整性判定
 
-**完整性校验用标签数而非字符数（`MIN_TAG_RATIO = 0.8`）。**
+**校验用标签数而非字符数。**
 中文译文字符数天然比英文原文少一半左右，按字符判断会大量误报；HTML 标签要求原样保留，标签数与语言无关。
 
+**【不变量】标签必须分块级和内联两个口径，只有块级能判失败。**
+块级标签（`p` / `div` / `h1`–`h6` / `li` / `table` / `img` …，集合见 `agent_tools._BLOCK_TAGS`）与段落一一对应，少一个就是真的少一段内容，因此它是硬指标：低于 `MIN_BLOCK_TAG_RATIO`（0.8）即判漏译。内联标签（`a` / `em` / `span` / `strong` / `br`）模型会系统性地吞掉而正文一字不缺，低于 `MIN_INLINE_TAG_RATIO`（0.8）只在返回值和日志里点名，不阻塞保存。`img` 归进块级——丢一张图是真的内容缺失。
+
+早期只有一个全标签口径（`MIN_TAG_RATIO = 0.8`），把"整段没译"和"内联标签被吞"混为一谈。《Marriage and Morals》第 5 章因此卡死：正文完整译完，只丢了 5 个脚注 `<a>` 和 2 个 `<em>`，全标签 49/63 = 77.8% 擦线掉下 0.8 就被判漏译。
+
+| 只数开标签 | div | h2 | p | span | strong | br | a | em |
+|---|---|---|---|---|---|---|---|---|
+| 原文 | 1 | 1 | 8 | 9 | 2 | 1 | 8 | 2 |
+| 译文 | 1 | 1 | 8 | 9 | 2 | 1 | **3** | **0** |
+
+新口径下这一章块级 10/10 直接通过，内联 15/22 记一行告警。
+
+`_count_tags(html, block_only=...)` 的两个口径出自同一次 `findall`，**`block_only=False` 的结果必须与历史上的 `_TAG_RE` 逐字节一致**（都要求闭合 `>`、都同时数开闭标签、都不匹配 `<!--` / `<?xml`），否则日志里 `DATA save_chapter` 的 `tags` / `source_tags` 就不能和历史数据比了。点名"少了哪些标签"的 `_missing_tag_names` 只比开标签：闭标签是镜像，两种都数会让数字翻倍。
+
 **块内漏译在 store 时刻校验，块缺失在 save 时刻硬拦。**
-store 时比对该块译文与原文的标签数，不达标当场要求补译（同一块只提醒一次，避免模型卡在补译-拒绝的死循环里）——此时模型手里还有这块原文，能直接补；等到 save 才发现，模型已经不知道漏的是哪一段了。
+store 时比对该块译文与原文的**块级**标签数，不达标当场要求补译（同一块只提醒一次，避免模型卡在补译-拒绝的死循环里）——此时模型手里还有这块原文，能直接补；等到 save 才发现，模型已经不知道漏的是哪一段了。
 save 侧"每块都必须有译文"是硬规则、不设放行次数：分块可以反复获取，模型总能补上，放行等于把漏译静默写进成品。
 
+**【不变量】工具的返回值不能承诺机制上做不到的事。**
+旧版 store 说"请补译"、docstring 说"再次调用会重新拿到同一块"，但 `pending_chunks` 只统计"完全没有译文"的块，`get_untranslated_content` 永远不会再发放它——承诺是假的，模型拿不回原文，只能在工具之间转圈。
+现在这句承诺由 `take_reissue_chunk` 兑现：`pending` 为空时作废一个块级标签不达标的块的译文，重新发放它的原文，并在提示里写明"原有译文已作废，请重新完整翻译整块"。**只清 `chunk_translations`，不动 `chapter_chunks`**——"分块发放必须非破坏性"说的是原文分块在整个 run 里只读、永不消失，这里满足。每块只给一次机会（`chunk_reissued` 记账）：store 是追加语义，反复重发会把译文越攒越乱；一次重译仍不达标说明模型解决不了，该退回章节级重试。
+`store_translation_chunk` 写完最后一块和 `check_chapter_progress` 都会先查 `reissuable_chunks`，有待重译的块就指向 `get_untranslated_content` 而不是"可以保存了"。三个工具口径必须一致——一个说"可以保存了"、另一个说"还得重译"，模型就会在两者之间转圈。这也是最后一次低成本挽回的机会：模型一旦去保存，全章就按块级标签判定，整章退回重译。
+
 **【不变量】判定不完整的章节不写进 `completed_chapters`。**
-全章标签数仍不达标时，译文照样写进 book（部分译文比整章原文有用）并记入 `ctx.incomplete_chapters`，但不标记完成，从而触发本次重试、下次 `--resume` 重译。曾经"拒绝一次就放行并标记完成"，残缺章节会被 `--resume` 永远跳过。
+全章块级标签仍不达标时，译文照样写进 book（部分译文比整章原文有用）并记入 `ctx.incomplete_chapters`，但不标记完成，从而触发本次重试、下次 `--resume` 重译。曾经"拒绝一次就放行并标记完成"，残缺章节会被 `--resume` 永远跳过。
+因此 save 只有两个终点：完整保存、或保存但判定不完整。**不给它加"先去重译再来保存"的拒绝路径**——那会让 save 可能一次都不成功，本章连部分译文都写不进 book。要重译得在模型决定保存之前引导（上一条）。
+
+**【不变量】保存过的章节，所有章节级工具只回同一句收尾指令。**
+`save_translated_chapter` 的两个终点都登记 `finished_chapters`，此后 `check_chapter_progress` / `get_untranslated_content` / `store_translation_chunk` / `save_translated_chapter` 一律走 `_already_finished`：同一句"本章已结束，不要再调用任何章节工具，直接用一句话说明情况"。
+少了这个守卫，save 说"本次任务到此结束"，另外两个工具同时说"都已完成，请调用 save_translated_chapter"——三方互相打脸且没有一个合法的收尾动作，模型只能在唯一"安全"的工具上转圈，烧到 `request_limit` 为止（实测第 5 章刷了 15 次"已无待译分块"直到用户 Ctrl-C）。
+术语表工具**不加**守卫：日志里模型有 `save → get_glossary → update_glossary` 的顺序，拦掉会丢术语。"还有块没译文"的早期拒绝也不登记——那一条正是要让模型继续干活。
 
 **工具的错误不计入重试，只有 `request_limit` 兜底。**
 工具的错误是 `return "错误：…"` 而不是 `raise ModelRetry`，pydantic-ai 视为调用成功，既不计入 `max_tool_retries` 也不中断 run。因此模型可以在同一个错误上无限循环，唯一的刹车是 `UsageLimits(request_limit=MAX_REQUESTS)`。这条约束直接推导出诊断日志里的"每次工具调用都留一行"不变量。
@@ -347,7 +377,7 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 - **【不变量】每一次工具调用都留一行。** 本身有专门日志的工具（发放块 / 写入块 / 保存章节 / 保存目录）保持原样，其余工具走 `logger.tool_call`（INFO），所有错误与空转 return 走 `logger.tool_error`（WARN + VERBOSE 控制台）。
   原因见"工具的错误不计入重试"：这类错误天然可以无限循环。实测一章 208 token 的 titlepage 空转掉 128 个请求、4 分 01 秒后抛 `UsageLimitExceeded`，而日志里只有一行"发放块 0"，事后完全无法判断它在调什么（`run_result` 只在 run 成功返回时才写，异常路径什么都没有）。空转时刷屏的重复行正是需要的证据，且被 `request_limit` 天然限量。
 - 诊断内容按 `{日志名}_ch{章}_try{尝试}_{类型}.{后缀}` 完整落盘（不截断）：`leaked.txt` 是文本形式工具调用的原始输出（据此判断是否截断，也保住了里面已译好的正文），`rejected.html` 是判定漏译的全章译文
-- `DATA` 前缀的 JSON 行（`save_chapter` / `chapter_failed` / `finish`，含 `thin_chunks` 块号），便于脚本统计失败分布
+- `DATA` 前缀的 JSON 行（`save_chapter` / `chapter_failed` / `finish`），便于脚本统计失败分布。`save_chapter` 里 `tags` / `source_tags` 是全标签口径（与历史日志可比），另有 `block_tags` / `source_block_tags`（判定依据）、`inline_tags` / `source_inline_tags`、`thin_chunks`（块级不达标的块号）、`reissued_chunks`（被作废重发过的块号）
 
 `get_logger()` 是模块级单例——`agent_tools.py` 里的工具函数拿不到 translator 实例，只能靠模块级变量共享。
 

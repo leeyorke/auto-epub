@@ -134,8 +134,10 @@ OUTPUT_MAX_TOKENS = 8192
 # 单章失败后的重试次数
 MAX_CHAPTER_RETRIES = 2
 
-# 漏译判定：译文/原文的 HTML 标签数比例下限
-MIN_TAG_RATIO = 0.8
+# 漏译判定：块级标签（p/div/h*/li…）比例下限，低于此判漏译
+MIN_BLOCK_TAG_RATIO = 0.8
+# 内联标签（a/em/span…）比例下限，低于此只告警，不阻塞保存
+MIN_INLINE_TAG_RATIO = 0.8
 
 # 启用图片翻译（也可用 --images 覆盖）
 TRANSLATE_IMAGES = True  # 默认 False
