@@ -7,6 +7,7 @@ import re
 from collections import Counter
 from typing import Dict, List, Optional, Set
 
+from bs4 import BeautifulSoup
 from ebooklib import epub
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
@@ -758,12 +759,42 @@ def finalize_chapter(ctx: EpubContext, chapter_index: int) -> tuple[bool, str]:
         )
         logger.dump_buffer(chapter_index, translated_html)
 
-    # 更新章节内容：即使判定不完整也写进去，部分译文比整章原文有用；
-    # 但不标记完成，交给上层重试 / 下次 --resume 重译。
-    chapter.set_content(translated_html.encode("utf-8"))
+    # 更新章节内容：用原章节的 soup 做模板，只替换 body 内容。
+    # 注意 ebooklib 写盘时（EpubHtml.get_content）会用自家模板重建整个文档，
+    # head 里只输出 item 上注册过的 links——所以必须先把【原始字节】里
+    # 声明的样式表 add_link 回去，否则 CSS 链接依旧会丢（soup 模板救不了它）。
+    raw_html = chapter.content.decode("utf-8", errors="ignore")
+    raw_soup = BeautifulSoup(raw_html, "html.parser")
+    for lnk in raw_soup.find_all("link", rel="stylesheet"):
+        href = lnk.get("href")
+        if not href:
+            continue
+        already = any(existing.get("href") == href for existing in chapter.links)
+        if not already:
+            chapter.add_link(href=href, rel="stylesheet", type="text/css")
+            logger.console(
+                f"章节 {chapter_index} 注册样式表 {href}",
+                ConsoleLevel.VERBOSE,
+            )
+
+    original_html = chapter.get_content().decode("utf-8", errors="ignore")
+    soup = BeautifulSoup(original_html, "html.parser")
+    body = soup.find("body")
+    if body:
+        # 清空原 body，注入译文
+        body.clear()
+        # 译文可能是多个根节点，用 BeautifulSoup 解析后再添加
+        translated_soup = BeautifulSoup(translated_html, "html.parser")
+        for child in translated_soup.contents:
+            body.append(child)
+        final_html = str(soup)
+    else:
+        # 兜底：找不到 body 就直接用译文（极少见）
+        final_html = translated_html
+    chapter.set_content(final_html.encode("utf-8"))
 
     if ctx.cache_manager and ctx.cache_key:
-        ctx.cache_manager.save_chapter(ctx.cache_key, chapter_id, translated_html)
+        ctx.cache_manager.save_chapter(ctx.cache_key, chapter_id, final_html)
 
     if tags_missing:
         reason = f"全章块级标签 {actual_block}/{source_block}"

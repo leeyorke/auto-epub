@@ -85,6 +85,8 @@
   delta 都携带一份 usage 且被 pydantic-ai 逐条累加（实测出现 5400 万）。判读以 chars /
   block_tags / finish_reason 为准；成本核算待修（取最后一个 usage 事件或用 tiktoken 本地估算）。
 
+# v1.3.1
+
 ## 2026-08-26 · step_plan「推理跑飞」定性与流式回切
 
 ### 背景
@@ -107,4 +109,23 @@
 - `reasoning_effort=low` ×3：推理 9.3~9.5 万字符，全部烧满——文档承诺的低档省 Token 在病态内容上不存在。
 - `enable_thinking=False`、极简提示词：均无效。
 - 抓包：请求体原样携带 `reasoning_effort`/`max_completion_tokens`/extra_body 合并字段，映射链路正确。
+
+## 2026-08-27 · 供应商不可控失败早停 + 章节样式保留
+
+### 背景
+
+1. 供应商侧不可控失败（推理跑飞、内容审查等）导致同一块反复重试、白白烧额度。
+2. 章节样式丢失（head/CSS 丢失）长期未修。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| chunk_translator.py | translate_one_chunk 在 except 中识别 UnexpectedModelBehavior，直接保留原文、标记通过、不再重试 |
+| agent_tools.py | finalize_chapter 用 BeautifulSoup 以原章节 soup 为模板，只替换 body 内容，保留 head/CSS；缓存同步存全量 HTML |
+| docs/ARCHITECTURE.md | 已知问题：章节样式丢失标记为已修复；新增「供应商不可控失败直接保留原文」条目 |
+
+### 实测
+- 代码静态检查通过（ruff check/format）。
+- 导入测试通过。
 

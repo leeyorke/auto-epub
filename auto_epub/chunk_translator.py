@@ -35,6 +35,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from pydantic_ai import Agent, UsageLimits
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 
 from .agent_tools import (
     _BLOCK_TAGS,
@@ -456,6 +457,23 @@ async def translate_one_chunk(
                 attempt,
                 _stats("", ok=False, reason=f"{type(e).__name__}: {e}"),
             )
+            # 供应商侧不可控失败（推理跑飞、内容审查等）：重试同一块大概率同样结果，
+            # 直接保留原文算完成，避免把整章预算烧在同一块上。
+            if isinstance(e, UnexpectedModelBehavior):
+                stored[chunk_index] = source
+                logger.chunk_result(
+                    chapter_index,
+                    chunk_index,
+                    total,
+                    attempt,
+                    _stats(
+                        source,
+                        ok=True,
+                        passthrough=True,
+                        reason="供应商不可控，保留原文",
+                    ),
+                )
+                return True
             continue
         # 先剥壳（围栏 / 前言），再摘术语块，剩下的才是要写进书里的正文
         translated, terms_body = split_terms_block(clean_model_html(raw, source))
