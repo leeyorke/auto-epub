@@ -4,9 +4,9 @@
 
 ## 总体架构
 
-**Python 编排 + Agent 执行**：章节循环、内容切分、重试、写盘时机全部由 Python 控制，Agent 只在"翻译一个章节"这一粒度上自主调度工具。
+**Python 编排 + Agent 执行**：章节循环、内容切分、块级循环、重试、写盘时机全部由 Python 控制。**章节正文的翻译是"一块原文进、一块译文出"的纯函数调用，模型没有任何工具可调**；工具只剩目录与图片两个阶段在用。
 
-早期版本是让 Agent 在单次 run 内翻完整本书，实际跑下来有两个致命问题：上下文随章节数无限累积，以及某一章失败后无法定位、无法单独重试。现在改成每章一次独立 run。
+演进路线是一路收窄模型的自主权：最早让 Agent 在单次 run 内翻完整本书（上下文随章节数无限累积，且某章失败后无法定位）→ 改成每章一次独立 run、模型在 run 内用工具循环取块存块（单章内 message history 仍然无界累积，37 块的章节必然撞 400，见"块级 run 的由来"）→ 现在每块一次独立 run，单请求输入与块序号无关。
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -20,34 +20,32 @@
 │                (translator.py - 编排器)                  │
 │                                                          │
 │  - 读取 EPUB，回填缓存中已完成章节的译文                 │
-│  - 逐章循环：切分 → 一次 Agent run → 校验落盘 → 重试     │
+│  - 逐章循环：切分 → 逐块翻译 → 校验落盘 → 重试           │
 │  - 目录阶段、图片阶段各一次独立 run                      │
 │  - 收尾写盘并如实报告完成/失败章节数                     │
-└──────────────────────┬──────────────────────────────────┘
-                       │ 每章一次 agent.run(deps=EpubContext)
-                       │ 外层套 agent.sequential_tool_calls()
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│                 pydantic-ai Agent                        │
-│                                                          │
-│  - 循环发放分块、翻译、写回，直到本章每块都有译文        │
-│  - 保存本章；被拒时按错误提示补译                        │
-│  - 记录新出现的专有名词                                  │
-└──────────────────────┬──────────────────────────────────┘
-                       │
+└─────────┬───────────────────────────────┬───────────────┘
+          │ 每块一次 chunk_agent.run()    │ 目录 / 图片各一次
+          │ 无 deps、无工具、无 history   │ agent.run(deps=EpubContext)
+          │                               │ 外层套 sequential_tool_calls()
+          ▼                               ▼
+┌──────────────────────────┐  ┌──────────────────────────────┐
+│  chunk_agent（无工具）   │  │   epub_agent（带工具集）     │
+│  chunk_translator.py     │  │                              │
+│                          │  │  - 目录：列出→翻译→保存      │
+│  一块原文 → 一块译文     │  │  - 图片：读取→识别→写回      │
+│  上下文靠"接力包"拼进    │  │  - 顺手记录专有名词          │
+│  prompt，不靠 history    │  │                              │
+└──────────────────────────┘  └──────────────┬───────────────┘
+                                             │
+                       ┌─────────────────────┘
                        ▼
 ┌─────────────────────────────────────────────────────────┐
 │              EPUB Toolsets (agent_tools.py)              │
+│              **只服务目录与图片两个阶段**                │
 │                                                          │
 │  📖 信息查询:                                            │
 │     - get_book_info / list_chapters                      │
-│     - check_chapter_progress   （本章还缺哪些块）        │
 │     - get_translation_progress                           │
-│                                                          │
-│  📝 章节翻译:                                            │
-│     - get_untranslated_content   （发放缺译文的块）      │
-│     - store_translation_chunk    （按块号写入，可多次）  │
-│     - save_translated_chapter    （保存，含完整性校验）  │
 │                                                          │
 │  📚 术语管理:                                            │
 │     - get_glossary / update_glossary                     │
@@ -69,17 +67,17 @@
 │     - 导航文档（nav.xhtml）识别与标题替换                │
 │                                                          │
 │  📝 TranslationLogger (logger.py)                        │
-│     - 分块尺寸、token 用量、工具调用序列、失败原因       │
+│     - 分块尺寸、token 用量、每块每次尝试一行、失败原因   │
 │                                                          │
 │  💾 CacheManager (cache_manager.py)                      │
-│     - 进度 / 章节 / 图片缓存，加锁 + 原子写入            │
+│     - 进度 / 章节 / **块** / 图片缓存，加锁 + 原子写入   │
 │                                                          │
 │  📋 Models (models.py)                                   │
 │     - Pydantic 数据模型                                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-`finalize_epub` 定义在 `agent_tools.py` 里，但**不是** Agent 工具，而是普通函数：写盘时机必须由 Python 在校验完成度之后决定，否则模型可能在漏章的情况下提前落盘。
+`finalize_epub` 与 `finalize_chapter` 都定义在 `agent_tools.py` 里，但**不是** Agent 工具，而是普通函数：写盘时机必须由 Python 在校验完成度之后决定，否则模型可能在漏章的情况下提前落盘。
 
 **技术栈**：Python >= 3.10、pydantic-ai（Agent 框架）、ebooklib（EPUB 解析）、BeautifulSoup4 + lxml（HTML/XML 操作）、typer（CLI）、tiktoken（token 计数）、ruff、uv。
 
@@ -90,48 +88,58 @@
 **职责：**
 - 读取 EPUB、加载缓存、把已完成章节的译文回填进 book 对象
 - 计算待翻译章节列表，逐章调用 `_translate_chapter_with_retry`
-- 每章每次尝试前调用 `ctx.prepare_chapter(index)` 完成切分并重置该章状态
-- run 结束后**以缓存进度为准**校验本章是否真的落盘，失败则重试
+- **每章只切分一次**（`ctx.prepare_chapter(index)`），章级重试不重切
+- 逐块调用 `translate_chapter_chunks`，再用 `finalize_chapter` 校验并落盘
 - 目录 / 图片阶段各起一次独立 run
 - 最后调用 `finalize_epub` 写盘，并如实报告 `completed/total`
 
-三个 run 入口（章节、目录、图片）统一走 `_run_agent`，由它套上 `sequential_tool_calls()` 与 `UsageLimits(request_limit=MAX_REQUESTS)`。
+两个工具型 run 入口（目录、图片）统一走 `_run_agent`，由它套上 `sequential_tool_calls()` 与 `UsageLimits(request_limit=MAX_REQUESTS)`，并记录用量与结束原因。块级 run 不走这里：它没有工具，不需要串行化守卫，用量由 `chunk_result` 逐块记录。
 
-**失败判定有两层：**
-1. run 的输出里出现 `<tool_call` / `<function=` / `</function>` —— 模型把工具调用写成了纯文本，本轮实际什么都没保存
-2. run 正常结束，但缓存进度里没有这一章（含"保存了但判定不完整"）
+**失败判定分两级：**
 
-两者都触发重试，尝试次数为 `MAX_CHAPTER_RETRIES + 1`。超过次数后该章记入 `failed_chapters`，输出文件里保持原文或残缺译文，不影响其余章节。
+*块级*（`validate_chunk`，每块一次）：译文为空、混进 `<tool_call` / `<function=` / `</function>`、`finish_reason=length`、或块级标签比例低于 `MIN_BLOCK_TAG_RATIO`。每块最多 `MAX_CHUNK_RETRIES + 1` 次尝试。
 
-### 2. Agent（单章执行层）
+*章级*（`finalize_chapter`）：还有块完全没有译文，或全章块级标签比例不达标。
 
-每次 run 只处理一个章节，提示词里写明本章被切成了几块、合法块号范围。Agent 的循环是：
+章级重试的额度是 `MAX_CHAPTER_RETRIES + 1`，但**它基本不会真的重跑**：`chunk_attempts` 跨章级重试累计，而"每块都达标 ⇒ 加总必然达标"意味着整章不达标必然有块没过；那些块的块级额度既然已经在本轮用尽，再来一轮只会原地空转。所以 `_translate_chapter_with_retry` 在"所有坏块额度都用尽"时直接收工，不做无意义的循环。留着这层循环是为了兜住"坏块还有额度、却因为异常提前退出块循环"的情形。
+
+超过次数后该章记入 `failed_chapters`，输出文件里保持原文或残缺译文，不影响其余章节。
+
+### 2. 块级翻译（chunk_translator.py）
+
+每块一次独立流式 `agent.run_stream`（TIMEOUT 按「等响应头 / 相邻 delta 沉默」计，见「已知未解决问题」），**run 与 run 之间没有 message history**，所以单请求输入与块序号无关：
 
 ```
-get_untranslated_content(n)  → 翻译该块 → store_translation_chunk(n, chunk_index, 译文)
-      ↑                                              │
-      └──────────── 工具返回值告知还缺哪些块 ────────┘
-                              │ 每块都有译文
-                              ▼
-          [update_glossary] → save_translated_chapter(n)
+Python: 取第 i 块原文 + 拼接接力包
+   → chunk_agent.run_stream(prompt)  # 无工具、无 deps、无历史；流式收全文再校验
+   → clean_model_html（剥围栏/前言）
+   → split_terms_block（摘掉末尾术语块）
+   → validate_chunk（块级标签比例 / 截断 / 工具调用泄漏）
+   → 通过：写 chunk_translations[章][i] + 写块缓存 + 并入术语表
+     不通过：留在内存但不进缓存，重试同一块
 ```
 
-`retries=3`（client.py）同时是 pydantic-ai 的 `_max_tool_retries` 和 `_max_result_retries`；`MAX_REQUESTS` 限制单次 run 的 API 请求数，是模型陷入死循环时唯一的刹车（原因见"工具错误不计重试"）。
+上下文靠 `build_carryover` 拼进 prompt，硬上限 `CARRYOVER_MAX_TOKENS`，超了按「接缝 > 术语 > 风格锚点」的优先级砍：
 
-这个循环有两个岔路，都在"完整性判定"里详述：某块漏了整段内容时，`get_untranslated_content` 会作废它的译文并重发原文（每块一次）；`save_translated_chapter` 一旦返回，本章所有章节级工具就只回同一句收尾指令，run 才有唯一的出口。
+| 段 | 内容 | 条件 |
+|---|---|---|
+| 接缝 | 上一块原文尾 + 译文尾各 `CARRYOVER_SEAM_CHARS` 字 | `chunk_index > 0` |
+| 术语 | `glossary` 里 key 真的出现在**当前块原文**中的条目 | 有命中 |
+| 风格锚点 | 本章首块原文/译文各 `CARRYOVER_STYLE_CHARS` 字 | `chunk_index >= 2` |
+
+**这个包必须是常量级。** 一旦让它随块号增长（例如带上"本章已译全文"），就又回到了被 400 撞墙的老路。
 
 ### 3. Toolsets（工具层）
 
 **设计原则：**
 - 每个工具职责单一，工具间相互独立
 - 通过 `RunContext[EpubContext]` 共享状态
-- 工具的返回值同时承担"下一步该做什么"的引导作用，比如发放分块时会附上"本章还缺 N 块、块号是哪些"
+- 工具的返回值同时承担"下一步该做什么"的引导作用
 
 **信息查询类：**
 ```python
 get_book_info()                # 书籍元信息
 list_chapters()                # 章节列表及翻译状态
-check_chapter_progress()       # 本章还缺哪些块（块号）
 get_glossary()                 # 术语表
 get_translation_progress()     # 翻译进度
 list_images()                  # 图片列表
@@ -139,10 +147,6 @@ list_images()                  # 图片列表
 
 **翻译操作类：**
 ```python
-get_untranslated_content()  # 发放下一个还没有译文的块（非破坏性，不弹出）；
-                            # 没有这种块时，作废一个漏了整段的块并重发它的原文
-store_translation_chunk()   # 按 chunk_index 写入译文，同块多次调用则追加
-save_translated_chapter()   # 保存本章，含护栏；调用后本章所有工具即闭嘴
 update_glossary()           # 更新术语表
 translate_toc()             # 列出目录项
 save_translated_toc()       # 保存目录，并同步 nav.xhtml
@@ -150,9 +154,13 @@ get_image_base64()          # 读取图片
 save_translated_image()     # 保存图片
 ```
 
+四个章节级工具（`get_untranslated_content` / `store_translation_chunk` / `save_translated_chapter` / `check_chapter_progress`）已随块级 run 一并下线，它们的职责回到 Python 侧（分别是块循环、字典写入、`finalize_chapter`、无消费方）。这不只是搬家：这些工具的 schema 在旧实现里**每个请求都要重发一遍**，约 1.8k tokens。
+
 **Python 侧函数（不是工具）：**
 ```python
+finalize_chapter(ctx, index)      # 校验完整性并写回 book / 缓存 / 进度
 finalize_epub(ctx, output_path)   # 收尾写盘
+merge_glossary(ctx, terms)        # 并入术语表并落盘（走 update_progress）
 collect_toc_titles / apply_toc_titles / sync_nav_documents   # 目录与导航同步辅助
 ```
 
@@ -173,16 +181,15 @@ class EpubContext:
 
     chapter_chunks: Dict[int, List[str]]           # 各章原文分块（翻译期间只读）
     chunk_translations: Dict[int, Dict[int, str]]  # {章节: {块号: 译文}}
-    chunk_warned: Dict[int, Set[int]]              # 已提醒过"疑似漏译"的块
-    chunk_reissued: Dict[int, Set[int]]            # 已作废重发过的块（每块一次）
-    saved_chapters: Set[int]                       # 完整保存成功的章节
+    chunk_attempts: Dict[int, Dict[int, int]]      # {章节: {块号: 已尝试次数}}
     incomplete_chapters: Dict[int, str]            # 保存了但判定不完整 {章节: 原因}
-    finished_chapters: Set[int]                    # 本次 run 已走完 save 的章节
 ```
 
-派生状态一律由方法实时计算，不额外维护副本：`chunk_count` / `pending_chunks`（缺译文的块号）/ `assembled_translation`（按块号排序拼接）/ `source_tag_count`（可选 `block_only`）/ `thin_chunks`（块级标签不达标的块号）/ `reissuable_chunks`（还没用掉重译机会的 `thin_chunks`）。唯一有副作用的是 `take_reissue_chunk`——它作废一个块的译文并记账。
+派生状态一律由方法实时计算，不额外维护副本：`chunk_count` / `pending_chunks`（缺译文的块号）/ `assembled_translation`（按块号排序拼接）/ `source_tag_count`（可选 `block_only`）/ `thin_chunks`（块级标签不达标的块号）。块级尝试次数用 `attempts(章, 块)` 读、`record_attempt(章, 块)` 记。
 
-关键方法 `prepare_chapter(index)`：切分章节、重置该章所有中间状态（含 `chunk_reissued` 与 `finished_chapters`）、记录分块尺寸到日志，返回分块数。**它是普通方法，不是 Agent 工具**——见下节。
+`EpubContext` 现在**跨 run 存活**：它不再是某一次 run 的 `deps`，而是 Python 侧章节循环的状态容器，块级 run 完全不碰它（无 deps）。
+
+关键方法 `prepare_chapter(index)`：切分章节、重置该章译文、记录分块尺寸到日志，返回分块数。**它是普通方法，不是 Agent 工具**——见下节。**`chunk_attempts` 不在这里重置**：否则每块 3 次 × 章级 3 次 = 9 次，重试次数会相乘。
 
 ## 关键设计决策与不变量
 
@@ -194,7 +201,8 @@ class EpubContext:
 `EpubContext.prepare_chapter` 在 run 之前把章节切好放进 `chapter_chunks`，模型只能取、不能重置。曾经把切分做成 Agent 工具，模型在翻译中途重新切分会清空已攒的译文，导致该章永远保存不了。
 
 **【不变量】分块发放必须是非破坏性的。**
-`get_untranslated_content` 只"发放下一个还没有译文的块"，不弹出；`store_translation_chunk` 必须带 `chunk_index`，写入哪一块由块号决定，译文按块号排序拼接（模型乱序写入也能还原）。
+Python 按 `pending_chunks()` 决定发哪块，写入靠 `chunk_index` 定位（`chunk_translations[章][块号]`），译文按块号排序拼接；作废重发只清译文、**绝不动 `chapter_chunks` 里的原文**。章级重试前只清 `thin_chunks` 的译文，通过校验的块原样保留、不重复花钱；`prepare_chapter` 也移出了重试循环，避免重切把已译好的块清掉（关掉缓存时那些译文就真丢了）。
+拆成块级 run 之后这条依然是核心：模型不再参与调度，但"按块号定位"是 `EpubContext` 跨 run 存活、以及块缓存能只补坏块的前提。
 早期版本用 `pending.pop(0)` 队列，一旦某块的 store 调用被输出截断，这块原文就永久消失了——模型只能跳过它继续下一块（静默漏译），或者整章重来。日志实测一次运行里 3 个章节各丢 1 块，而全章标签比例仍在 86% 以上，比例型指标结构上抓不住这种 1/10 的丢失（换成 `MIN_BLOCK_TAG_RATIO` 也一样：丢 1/10 块只掉到 90%）。
 
 **分块器必须能下钻单根元素。**
@@ -205,7 +213,38 @@ class EpubContext:
 **`INPUT_MAX_TOKENS` 必须显著小于 `OUTPUT_MAX_TOKENS`。当前取值 `5000 / 16384`。**
 译文 + 完整 HTML 标签 + JSON 字符串转义叠加后输出会放大：拿现有缓存和日志里配对的 500 组"发放/写入"实测，输出/输入 token 比中位 1.32、p90 1.68、p99 1.87、最大 1.99（其中 JSON 转义只占 +1%，主要来自中文 token 密度）。此外推理 token 也计入 `max_tokens` 却不出现在 `result.output` 里，因此"输出看着不长"并不代表没被截断。
 按最坏比例 2.0 算：`5000 × 2 + 6000(推理) ≈ 16000 < 16384`，即使供应商不认 `reasoning_effort=low`、推理照旧吃掉 6000 token 也留有余量。这里的 6000 是留给推理的预留额度，不是观测值——stepfun 至今没在 `usage.details` 里报过 `reasoning_tokens`（现有日志里 details 只出现过 `cached_tokens`），推理到底吃了多少无法从日志验证，能直接观测的只有 `finish_reason`。
-调大 `INPUT_MAX_TOKENS` 能成倍减少分块数，进而按平方级降低单章累计输入 token（每次请求都要重发已累积的对话），但单请求峰值上下文不变；代价是一旦某块译文超预算被截断，重试同一块还会再次超出，整章会耗尽重试次数。
+调大 `INPUT_MAX_TOKENS` 能成倍减少分块数，进而线性降低整章的累计输入 token，但**单请求峰值上下文不变**；代价是一旦某块译文超预算被截断，重试同一块还会再次超出，整章会耗尽重试次数。
+（拆成块级 run 之前，累计输入是块数的**平方**级——每次请求都要重发已累积的对话。那个平方项连同 message history 一起消失了，见下节。）
+
+### 块级 run 的由来（2026-08 的 400 撞墙）
+
+翻译《Designing Data-Intensive Applications》章节 23（`ix01.html`，索引页，37 块 / 162331 tokens）时，三次尝试全部失败，其中两次是供应商直接返回 400：
+
+```
+'max_tokens' is too large: 16384. This model's maximum context length is
+262144 tokens and your request has 246773 input tokens
+```
+
+**根因不是章节总量超上下文**（162k < 262k），而是"一章一个 `agent.run`"里 message history 无界累积。每块会在历史里留下两份：
+
+| 项 | 约 tokens |
+|---|---|
+| `get_untranslated_content` 的返回值（原文） | 4900 |
+| `store_translation_chunk` 的调用参数（译文） | 4600 |
+| 合计 | **≈ 9500 / 块**，且整个 run 期间永不丢弃 |
+
+可用输入窗口 = 262144 − 16384 = 245760，除以 9500 ≈ **26 块就是天花板**。两次失败都精确死在第 26 块（246773 ÷ 26 ≈ 9491），与推算吻合。而那 247k 里真正对翻译第 27 块有用的信息只有 5–8k（术语、上一块接缝、风格），死重率约 97%。
+
+**为什么选"无工具"而不是"压缩历史"**：块级 run 只要还带工具，就要为 10 个工具的 schema 每个请求付一遍约 1.8k tokens，而块级翻译一个工具都不需要。更重要的是，去掉工具顺带消灭了本项目最凶的故障模式——**工具调用参数 JSON 被截断 → 模型退化成把 `<tool_call>` 当文本输出**：没有工具就没有工具参数。
+
+**收益的性质要说清楚**：改造前那 4.34M 单章累计输入里 4.1M 是缓存读（94.6%），因为每次重发同一个增长前缀恰好全部命中 prompt cache。拆 run 之后可缓存前缀只剩 system prompt，块原文永远是新的。按缓存读 1/10 价折算，**账单大约降到 1/2，不是 1/10**。这个改动的真正价值是"长章节从不可能变成可能"，不是省钱。
+
+| | 改造前 | 改造后 |
+|---|---|---|
+| 第 N 块单请求输入 | 2k + N × 9.5k | **恒定约 8k** |
+| 第 26 块 | 247k → 400 撞墙 | 8k |
+| 章节 23（37 块） | 不可能完成 | 累计约 296k，正常 |
+| 每块请求数 | 约 2.4 | **1** |
 
 ### 并发与持久化
 
@@ -217,8 +256,8 @@ pydantic-ai 在 `_agent_graph.py` 里对一个响应内的多个 tool call 走 `
 `CacheManager` 用 `threading.RLock` 串行化进度读写，`_save_locked` 先写 `{key}.json.{pid}.tmp` 再 `os.replace`（`write_text` 会先截断，交错写入就会撕裂文件）。跨调用的改动走 `update_progress(cache_key, mutate)`，把改动塞进同一个临界区；单独 `load_progress` → 改 → `save_progress` 的写法会丢更新，已从代码里清除。
 `load_progress` 另外容忍历史遗留的尾部残留：用 `raw_decode` 取首个完整文档并立刻重写成干净文件。
 
-**`_is_chapter_done` 读不到进度时退回 `ctx.saved_chapters`。**
-进度文件损坏或被删时若一律返回假，每章都会被判成"未落盘"而白白耗尽重试次数。
+**章节是否落盘由 `finalize_chapter` 的返回值决定，不再回读进度文件。**
+旧实现在 run 结束后用 `_is_chapter_done` 回读进度来判断这一章成没成，于是进度文件损坏或被删时每章都会被判成"未落盘"而白白耗尽重试次数（当时的兜底是退回 `ctx.saved_chapters`）。现在保存动作本身在 Python 侧，`finalize_chapter` 直接返回 `(是否完整, 说明)`，判定不依赖任何外部状态。`ctx.saved_chapters` 仍在保存成功时登记，但已没有读取方，属于留待清理的遗留字段。
 
 **进度 JSON 第一个键是 `book_name`。**
 缓存键是"文件绝对路径 + 目标语言"的 MD5，光看文件名认不出是哪本书，所以把书名（EPUB 文件名去后缀，与日志文件同名）记在最前面。旧缓存缺这个字段时默认空串，并在下次运行时回填并立即落盘——整本已翻完时后面不会再有 `save_progress` 把它写出去。
@@ -242,26 +281,26 @@ pydantic-ai 在 `_agent_graph.py` 里对一个响应内的多个 tool call 走 `
 
 `_count_tags(html, block_only=...)` 的两个口径出自同一次 `findall`，**`block_only=False` 的结果必须与历史上的 `_TAG_RE` 逐字节一致**（都要求闭合 `>`、都同时数开闭标签、都不匹配 `<!--` / `<?xml`），否则日志里 `DATA save_chapter` 的 `tags` / `source_tags` 就不能和历史数据比了。点名"少了哪些标签"的 `_missing_tag_names` 只比开标签：闭标签是镜像，两种都数会让数字翻倍。
 
-**块内漏译在 store 时刻校验，块缺失在 save 时刻硬拦。**
-store 时比对该块译文与原文的**块级**标签数，不达标当场要求补译（同一块只提醒一次，避免模型卡在补译-拒绝的死循环里）——此时模型手里还有这块原文，能直接补；等到 save 才发现，模型已经不知道漏的是哪一段了。
-save 侧"每块都必须有译文"是硬规则、不设放行次数：分块可以反复获取，模型总能补上，放行等于把漏译静默写进成品。
+**块内漏译在块级校验器里当场判定，块缺失在 `finalize_chapter` 硬拦。**
+`validate_chunk` 比对该块译文与原文的**块级**标签数，不达标就直接重译同一块——重试的输入是同一块原文，Python 手上一直有它，不存在"不知道漏的是哪一段"。`finalize_chapter` 侧"每块都必须有译文"是硬规则、不设放行次数：放行等于把漏译静默写进成品。
 
-**【不变量】工具的返回值不能承诺机制上做不到的事。**
-旧版 store 说"请补译"、docstring 说"再次调用会重新拿到同一块"，但 `pending_chunks` 只统计"完全没有译文"的块，`get_untranslated_content` 永远不会再发放它——承诺是假的，模型拿不回原文，只能在工具之间转圈。
-现在这句承诺由 `take_reissue_chunk` 兑现：`pending` 为空时作废一个块级标签不达标的块的译文，重新发放它的原文，并在提示里写明"原有译文已作废，请重新完整翻译整块"。**只清 `chunk_translations`，不动 `chapter_chunks`**——"分块发放必须非破坏性"说的是原文分块在整个 run 里只读、永不消失，这里满足。每块只给一次机会（`chunk_reissued` 记账）：store 是追加语义，反复重发会把译文越攒越乱；一次重译仍不达标说明模型解决不了，该退回章节级重试。
-`store_translation_chunk` 写完最后一块和 `check_chapter_progress` 都会先查 `reissuable_chunks`，有待重译的块就指向 `get_untranslated_content` 而不是"可以保存了"。三个工具口径必须一致——一个说"可以保存了"、另一个说"还得重译"，模型就会在两者之间转圈。这也是最后一次低成本挽回的机会：模型一旦去保存，全章就按块级标签判定，整章退回重译。
+**【不变量】返回值不能承诺机制上做不到的事。**
+**这条在块级路径上已经消失**：没有工具，也就没有工具返回值去许愿。补译由 Python 的重试循环实打实地执行——同一块原文原样再发一次，`build_chunk_prompt(retry=True)` 附上"上一次的译文被判定不合格"的说明。它对目录 / 图片工具仍然适用：那两个阶段的工具返回值依然是模型判断"下一步做什么"的唯一依据。
+留下当初的证据，因为它解释了为什么不能回退到工具型块循环：旧版 store 说"请补译"、docstring 说"再次调用会重新拿到同一块"，但 `pending_chunks` 只统计"完全没有译文"的块，`get_untranslated_content` 永远不会再发放它——承诺是假的，模型拿不回原文，只能在工具之间转圈。后来用 `take_reissue_chunk` 兑现这句承诺（作废一个块级标签不达标的块的译文、重发原文、每块只给一次机会），并要求 `store_translation_chunk` / `check_chapter_progress` / `save_translated_chapter` 三方口径一致——一个说"可以保存了"、另一个说"还得重译"，模型就会在两者之间转圈。这套记账（`chunk_warned` / `chunk_reissued` / `take_reissue_chunk` / `reissuable_chunks`）随工具一起删掉了，换成 `chunk_attempts` 一个计数器。
 
 **【不变量】判定不完整的章节不写进 `completed_chapters`。**
 全章块级标签仍不达标时，译文照样写进 book（部分译文比整章原文有用）并记入 `ctx.incomplete_chapters`，但不标记完成，从而触发本次重试、下次 `--resume` 重译。曾经"拒绝一次就放行并标记完成"，残缺章节会被 `--resume` 永远跳过。
-因此 save 只有两个终点：完整保存、或保存但判定不完整。**不给它加"先去重译再来保存"的拒绝路径**——那会让 save 可能一次都不成功，本章连部分译文都写不进 book。要重译得在模型决定保存之前引导（上一条）。
+因此 `finalize_chapter` 只有两个终点：完整保存、或保存但判定不完整。**不给它加"先去重译再来保存"的拒绝路径**——那会让它可能一次都不成功，本章连部分译文都写不进 book。要重译就在调用它之前重译（块级重试就在它前面）。
+块缓存是同一条不变量在块粒度上的延伸：**只有通过 `validate_chunk` 的块才写进 `chunks/`**，坏块的译文只留在内存。于是章级重试和 `--resume` 天然只重跑坏块，而不会把"存过就算过"扩散到块级。
 
-**【不变量】保存过的章节，所有章节级工具只回同一句收尾指令。**
-`save_translated_chapter` 的两个终点都登记 `finished_chapters`，此后 `check_chapter_progress` / `get_untranslated_content` / `store_translation_chunk` / `save_translated_chapter` 一律走 `_already_finished`：同一句"本章已结束，不要再调用任何章节工具，直接用一句话说明情况"。
-少了这个守卫，save 说"本次任务到此结束"，另外两个工具同时说"都已完成，请调用 save_translated_chapter"——三方互相打脸且没有一个合法的收尾动作，模型只能在唯一"安全"的工具上转圈，烧到 `request_limit` 为止（实测第 5 章刷了 15 次"已无待译分块"直到用户 Ctrl-C）。
-术语表工具**不加**守卫：日志里模型有 `save → get_glossary → update_glossary` 的顺序，拦掉会丢术语。"还有块没译文"的早期拒绝也不登记——那一条正是要让模型继续干活。
+**【不变量】保存过的章节，不能让任何入口再对同一章发号施令。**
+块级路径上这条**由结构本身保证**：章节级工具全部下线，`finalize_chapter` 是普通函数，Python 调完就往下走，模型没有任何机会对已保存的章节再做动作，`finished_chapters` / `_already_finished` 守卫连同工具一起删掉了。
+证据段留着，因为它是"不要回退到工具型块循环"的核心理由：当时 `save_translated_chapter` 的两个终点都登记 `finished_chapters`，此后 `check_chapter_progress` / `get_untranslated_content` / `store_translation_chunk` / `save_translated_chapter` 一律走 `_already_finished`，回同一句"本章已结束，不要再调用任何章节工具"。少了这个守卫，save 说"本次任务到此结束"，另外两个工具同时说"都已完成，请调用 save_translated_chapter"——三方互相打脸且没有一个合法的收尾动作，模型只能在唯一"安全"的工具上转圈，烧到 `request_limit` 为止（实测第 5 章刷了 15 次"已无待译分块"直到用户 Ctrl-C）。术语表工具当时**不加**守卫：日志里模型有 `save → get_glossary → update_glossary` 的顺序，拦掉会丢术语。
+一句话：多个工具对同一份状态各自表态，就一定会出现自相矛盾的出口。工具越少，这个风险越小；块级路径把它降到了零。
 
 **工具的错误不计入重试，只有 `request_limit` 兜底。**
-工具的错误是 `return "错误：…"` 而不是 `raise ModelRetry`，pydantic-ai 视为调用成功，既不计入 `max_tool_retries` 也不中断 run。因此模型可以在同一个错误上无限循环，唯一的刹车是 `UsageLimits(request_limit=MAX_REQUESTS)`。这条约束直接推导出诊断日志里的"每次工具调用都留一行"不变量。
+这条只对目录 / 图片工具适用了。工具的错误是 `return "错误：…"` 而不是 `raise ModelRetry`，pydantic-ai 视为调用成功，既不计入 `max_tool_retries` 也不中断 run，因此模型可以在同一个错误上无限循环，唯一的刹车是 `UsageLimits(request_limit=MAX_REQUESTS)`。这条约束直接推导出诊断日志里的"每次工具调用都留一行"不变量。
+块级路径没有这个问题：那里没有工具返回值，循环由 Python 的 `while ctx.attempts(...) <= MAX_CHUNK_RETRIES` 控制，次数硬上限。API 层的异常（超时、5xx、内容审查 451）会被 `translate_one_chunk` 捕获并**计入该块的尝试次数**——好处是不会无限重试，代价见"已知未解决问题"。
 
 ### 目录与导航
 
@@ -290,7 +329,8 @@ save 侧"每块都必须有译文"是硬规则、不设放行次数：分块可�
 
 **关于 `finish_reason=length` 的正确读法**（推翻了早期结论）：早期文档写"日志里仍出现 `length` 就说明两个字段都没被认"，这是反的——`length` 恰恰是**有上限在生效**的证据，只是无法从 finish_reason 区分截断发生在我们发的 16384 还是供应商自己的默认值。
 现有日志里 `length` 一共出现过 1 次（《The Design of Everyday Things》第 10 章，15 次响应中的第 2 次）：那次响应没能发出任何工具调用，pydantic-ai 补一轮请求后自行接上，本章 5 块全部写入、第 1 次尝试就保存成功（`tags 1142/1252`、`thin_chunks []`）。
-**结论：单次 `length` 是可恢复的，真正致命的是截断落在 `store_translation_chunk` 的参数中途**——参数 JSON 不完整，模型就会退化成把 `<tool_call>` 当文本输出（另一份日志里连续发生过 6 次）。所以看到 `length` 先看它有没有伴随"文本形式的工具调用"，偶发一次不必调参。
+**结论：在工具型路径上单次 `length` 是可恢复的，真正致命的是截断落在 `store_translation_chunk` 的参数中途**——参数 JSON 不完整，模型就会退化成把 `<tool_call>` 当文本输出（另一份日志里连续发生过 6 次）。这个致命形态随工具一起消失了：块级输出是纯文本，截断只会让译文短一截，不会让它变成假工具调用。
+块级路径还把 `length` 的归因精确到了块：`validate_chunk` 直接把 `finish_reason=length` 判为失败并重译同一块，日志里那一行就写着是第几块第几次尝试（旧实现只有章级聚合的"章节 6 有 1/5 次响应被截断"，看不出是哪块）。
 
 **deepseek 兼容。**
 client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼容 deepseek 等需要禁用思考模式的模型。
@@ -306,22 +346,27 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 1. 用户调用 CLI
    ↓
 2. create_translator() (client.py)
-   ├─ create_epub_agent() → 注册 epub_toolset
-   └─ new EpubTranslator(agent)
+   ├─ create_epub_agent()  → 注册 epub_toolset（目录 / 图片用）
+   ├─ create_chunk_agent() → toolsets=[]，块级翻译用
+   └─ new EpubTranslator(agent, chunk_agent)
    ↓
 3. translator.translate_epub()
-   ├─ init_logger → .epub_translation_logs/{书名}_{时间戳}.log
+   ├─ init_logger → ~/.auto-epub/logs/{书名}_{时间戳}.log
    ├─ 读取 EPUB、检测源语言
    ├─ 加载缓存进度（回填 book_name）
    ├─ 创建 EpubContext
    └─ 回填已完成章节的译文（缓存内容缺失的章节会被踢回待翻译）
    ↓
-4. 逐章循环（Python 控制，每章一次独立 run）
-   ├─ ctx.prepare_chapter(index)        # 切分 + 重置该章状态 + 记录分块尺寸
-   ├─ agent.run(单章提示词, deps=ctx)   # 外层 sequential_tool_calls + request_limit
-   │    └─ get_untranslated_content → 翻译 → store_translation_chunk(块号)
-   │       → [update_glossary] → save_translated_chapter
-   └─ 校验缓存进度 → 未落盘/判定不完整则重试（共 MAX_CHAPTER_RETRIES + 1 次尝试）
+4. 逐章循环（Python 控制）
+   ├─ ctx.prepare_chapter(index)        # 切分一次，章级重试不重切
+   ├─ translate_chapter_chunks()        # 块循环，每块一次独立 run
+   │    └─ 每块：查块缓存 → 命中即跳过；未命中则
+   │       build_chunk_prompt(原文 + 接力包) → chunk_agent.run_stream()
+   │       → clean_model_html → split_terms_block → validate_chunk
+   │       → 通过：写 chunk_translations[章][块] + 块缓存 + merge_glossary
+   │         不通过：重试同一块（每块共 MAX_CHUNK_RETRIES + 1 次）
+   ├─ finalize_chapter()                # 全章复查 → 写 book / 章节缓存 / 进度
+   └─ 未通过且仍有块有额度则章级重试（额度用尽直接收工）
    ↓
 5. 目录阶段（单次 run，可选）
    └─ translate_toc → save_translated_toc
@@ -338,7 +383,7 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 ### 缓存机制
 
 ```
-.epub_translation_cache/
+~/.auto-epub/cache/
 ├── {md5_hash}.json              # 翻译进度
 │   ├─ book_name                 # 书名（第一个键，用于认出这是哪本书）
 │   ├─ source_lang / target_lang
@@ -353,31 +398,42 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 └── {md5_hash}/
     ├── chapters/
     │   └── {md5(chapter_id)}.html
+    ├── chunks/
+    │   └── {md5(chapter_id)}/
+    │       └── {md5(块原文)}.html      # 内容哈希寻址，见下
     └── images/
         └── {md5(image_name)}
 ```
 
 缓存键为 `md5(文件绝对路径 + 目标语言)`。
 
+**缓存与日志统一放 `~/.auto-epub/`（`cache/` 与 `logs/`）**，不再散落在运行命令时的工作目录里。缓存键只含书籍绝对路径和语言、与缓存目录位置无关，所以搬目录不影响 `--resume`。旧版目录（工作目录下的 `.epub_translation_cache` / `.epub_translation_logs`）由 `settings.migrate_legacy_dir` 在首次创建 `CacheManager` / `TranslationLogger` 时**整体搬移**过去，规则刻意保守：只在「旧目录存在且目标不存在」时整目录 `shutil.move` 一次；目标已存在（新版已跑过）就按遗留物处理留在原处；搬移失败静默跳过——最坏情况只是丢一次断点续传，绝不能让迁移阻塞翻译。CLI 的 `clear` 命令指定书籍路径时按缓存键清除单本，**省略书籍路径时清空整个 cache 目录**（`CacheManager.clear_all`），后者是唯一会批量删缓存的入口。
+
+**块缓存用内容哈希而不是块号寻址**，因此 `models.py` 里不需要任何新字段：`INPUT_MAX_TOKENS` 调整或原书更新导致切分变化时，哈希自然不匹配 → 命中失败 → 重译，既不需要版本号，也不可能把 A 块的译文错位读成 B 块的。文件存在即进度，所以**不必为每块写一次进度文件**（否则一章 37 块就是 37 次全量 JSON 重写）。`clear_cache` 已经 `rmtree({cache_dir}/{cache_key})`，新目录自动被覆盖。
+
 **断点续传逻辑：**
 1. 加载进度文件，取出 `completed_chapters`
 2. 逐章从 `chapters/` 读回译文写进 book 对象
 3. 进度说已完成但缓存文件丢失的章节，从 `completed_chapters` 中移除并重新翻译——否则会静默输出原文
-4. 只对不在 `completed_chapters` 里的章节起 run
+4. 只对不在 `completed_chapters` 里的章节跑块循环
+5. 章内再按块续：每块先查 `chunks/`，命中就完全不发 API。因此上次跑到一半被 Ctrl-C 的长章节，重跑只补剩下的块，不会从头重译
 
 ## 诊断日志
 
-翻译失败在控制台上往往只留一行错误。`logger.py` 把细节写入 `.epub_translation_logs/{书名}_{时间戳}.log`：
+翻译失败在控制台上往往只留一行错误。`logger.py` 把细节写入 `~/.auto-epub/logs/{书名}_{时间戳}.log`：
 
-- 每章每次尝试的分隔行、逐块的 `tokens / chars / tags`
-- 每次 run 的输出长度、输出片段、token 用量、实际发起的工具调用序列
+- 每章每次尝试的分隔行、切分后的分块尺寸（`最大分块 N tokens，合计 M tokens`）
+- **【不变量】每块每次尝试都留一行**（`logger.chunk_result`）：块号 / 尝试次数 / `chars=原文→译文` / `block_tags=译/原(比例)` / token 用量 / `结束原因` / 失败原因，命中块缓存与"无可译文本原样透传"也各留一行。
+  块级 run 没有工具，也就没有"工具调用日志"可留，这一行是块级路径上发现空转与静默失败的唯一手段：**写不出这一行就说明代码路径漏了记账**。所以连"块级重试额度已用尽、本次不再请求"这种"什么都没干"的分支也必须留一行——否则它在日志里是一片空白。
+- 每次工具型 run（目录 / 图片）的输出长度、输出片段、token 用量、实际发起的工具调用序列
+- **【不变量】每一次工具调用都留一行**（目录 / 图片阶段）。本身有专门日志的工具（保存目录 / 保存图片）保持原样，其余工具走 `logger.tool_call`（INFO），所有错误与空转 return 走 `logger.tool_error`（WARN + VERBOSE 控制台）。
+  原因见"工具的错误不计入重试"：这类错误天然可以无限循环。实测一章 208 token 的 titlepage 空转掉 128 个请求、4 分 01 秒后抛 `UsageLimitExceeded`，而日志里只有一行"发放块 0"，事后完全无法判断它在调什么。空转时刷屏的重复行正是需要的证据，且被 `request_limit` 天然限量。
+  这条历史教训还留下一个补丁：`run_result` 原先只在 run 成功返回时才写，目录与图片阶段则**根本没有调用它**——run 正常返回但什么也没保存时，日志里一片空白。现在 `_run_agent` 对两个阶段都记录用量、结束原因，并在输出里出现文本形式工具调用时另打一条。
+- 诊断内容按 `{日志名}_{标签}_try{章级尝试}_{类型}.{后缀}` 完整落盘（不截断）：`rejected.html` 是判定漏译的全章译文，`chunk{块号}_a{块级尝试}.html` 是校验失败的块级原始输出（纯文本输出的失败样子五花八门——围栏、前言、截断、整段漏译，片段看不出结尾有没有被截断，所以完整存一份），`leaked.txt` 是文本形式工具调用的原始输出
+- `DATA` 前缀的 JSON 行（`save_chapter` / `chapter_failed` / `finish`），便于脚本统计失败分布。`save_chapter` 里 `tags` / `source_tags` 是全标签口径（与历史日志可比），另有 `block_tags` / `source_block_tags`（判定依据）、`inline_tags` / `source_inline_tags`、`thin_chunks`（块级不达标的块号）、`chunk_attempts`（`{块号: 尝试次数}`，取代了旧的 `reissued_chunks`）
 - token 用量里带 `usage.details`：`reasoning_tokens` 计入 `max_tokens` 却不出现在 `result.output` 里，是"输出看着不长却被截断"的隐形消耗者，所以只要供应商报了就记下来（stepfun 至今只报 `cached_tokens`，没报过 `reasoning_tokens`）
 - 每次模型响应的 `finish_reason` 序列（归一化值 + 括号内供应商原值）。`length` 是输出被 `max_tokens` 截断的直接证据，出现时额外打一条 WARN 并提示控制台；读法见"关于 `finish_reason=length` 的正确读法"
-- 每次 save 被拒的原因、判定不完整的章节和块号
-- **【不变量】每一次工具调用都留一行。** 本身有专门日志的工具（发放块 / 写入块 / 保存章节 / 保存目录）保持原样，其余工具走 `logger.tool_call`（INFO），所有错误与空转 return 走 `logger.tool_error`（WARN + VERBOSE 控制台）。
-  原因见"工具的错误不计入重试"：这类错误天然可以无限循环。实测一章 208 token 的 titlepage 空转掉 128 个请求、4 分 01 秒后抛 `UsageLimitExceeded`，而日志里只有一行"发放块 0"，事后完全无法判断它在调什么（`run_result` 只在 run 成功返回时才写，异常路径什么都没有）。空转时刷屏的重复行正是需要的证据，且被 `request_limit` 天然限量。
-- 诊断内容按 `{日志名}_ch{章}_try{尝试}_{类型}.{后缀}` 完整落盘（不截断）：`leaked.txt` 是文本形式工具调用的原始输出（据此判断是否截断，也保住了里面已译好的正文），`rejected.html` 是判定漏译的全章译文
-- `DATA` 前缀的 JSON 行（`save_chapter` / `chapter_failed` / `finish`），便于脚本统计失败分布。`save_chapter` 里 `tags` / `source_tags` 是全标签口径（与历史日志可比），另有 `block_tags` / `source_block_tags`（判定依据）、`inline_tags` / `source_inline_tags`、`thin_chunks`（块级不达标的块号）、`reissued_chunks`（被作废重发过的块号）
+- 每次 `finalize_chapter` 拒绝保存的原因、判定不完整的章节和块号
 
 `get_logger()` 是模块级单例——`agent_tools.py` 里的工具函数拿不到 translator 实例，只能靠模块级变量共享。
 
@@ -394,25 +450,33 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 
 ## 已知未解决问题
 
-**章节样式丢失。** `save_translated_chapter` 写入的是 body 级分块的拼接结果，`<html>` / `<head>` 外壳及其中的 CSS 链接会丢失。修复方向是保存时用原章节的 soup 做模板、只替换 body 内容。**用户已明确表示暂缓处理。**
+**章节样式丢失。** `finalize_chapter` 写入的是 body 级分块的拼接结果，`<html>` / `<head>` 外壳及其中的 CSS 链接会丢失。修复方向是保存时用原章节的 soup 做模板、只替换 body 内容。**用户已明确表示暂缓处理。**
+
+**传输层异常和内容不合格共用同一份重试额度。** `translate_one_chunk` 的 `except Exception` 把超时、5xx、内容审查 451 一律记成"该块的第 k 次尝试失败"（`chunk_translator.py:429-439`）。好处是任何异常都不会变成无限重试；代价是一个块可能三次尝试全部死在传输层，**从头到尾没拿到过一次译文**，却已经耗尽额度。2026-08-25 冒烟跑里章节 12 的块 0 就是这样：三次全是 `ModelAPIError: Request timed out.`。修复方向是把异常分成"重试可能有救"（超时、5xx、429）和"重试必然同样结果"（451 内容审查、400 参数错），前者不计入 `chunk_attempts` 但另设一个独立的传输重试上限，后者立即放弃、不浪费后两次。
+
+**`TIMEOUT = 60` 对大输出偏紧。** 这是单次 HTTP 请求的超时，而 OpenAI SDK 自己还会重试两次，所以**一次"块级尝试失败"的实际墙钟成本约 183 秒 ≈ 3 × 60**：冒烟跑里章节 12 的块 0 三次尝试分别落在 21:35:37 / 21:38:40 / 21:41:43，整整烧掉九分钟才判定失败。同一次跑里章节 15 唯一的块第 1 次超时、第 2 次成功（输出 8203 tokens），第 2 次从上一行到落地共 104 秒——如果它内部也重试过一轮，那真正成功的那次请求约 44 秒，正好压在 60 秒线上；这一步是推断，日志只记了 104 秒的总耗时。反过来看旧架构《DDIA》那次跑的 231 个成对样本：中位 21 秒、p90 33 秒、p99 94 秒，只有 3/231 超过 60 秒，所以 60 秒历史上是够用的，只是对单块大输出没有余量。当时只有这一次跑的 8 个超时样本，不足以断定；同日深夜已用探针定案并追加实测数据（见下一条）。
+
+**`TIMEOUT = 60` 偏紧已定案：瓶颈是隐藏推理抬高的首 token 延迟 + 真实总耗时 62~68 秒。** 2026-08-25 深夜用《DDIA》章节 23 块 1（提示词 5074 tokens）做两组探针：①流式成功，总 67.5 秒，但**首个 delta 要等 51.3 秒**——step-3.5-flash 的隐藏推理全部做完才吐第一个字——其后 80 个 delta 最大相邻间隔仅 0.7 秒、12072 字符一气呵成；②非流式直连（timeout=600）62.3 秒 `finish_reason=stop`、译文完整。即单请求真实墙钟 ≈ 62~68 秒，生产环境的 60 秒线恰好压在它下面，每次尝试 60s × (1 + SDK 内部重试 2 次) = 183 秒判死，与 `…235024` 日志的分秒完全吻合。同一批块当天下午（旧架构 `…171643`）每块只要 20~40 秒，说明晚上全军覆没是**供应商变慢叠加 60 秒余量为零**，不是块级重构改出来的 bug。**附带发现**：该模型无视 `"thinking": {"type": "disabled"}` 与 `reasoning_effort="low"`（实测 `reasoning_content` 长达 22663 字符，而 `usage.reasoning_tokens` 记 0，供应商未单独记账）；推理更长的抽样会把 `OUTPUT_MAX_TOKENS` 整个吃穿 → 正文为空或截断 → pydantic-ai 输出校验重试后抛 `UnexpectedModelBehavior: Exceeded maximum retries (1) for output validation`（实测 144.8 秒 ≈ 2 × 72 秒）——**这条调大 TIMEOUT 治不了**。**已实施（2026-08-25 深夜）**：块级 run 改走 `agent.run_stream` 收全量文本再走原有校验（`translate_one_chunk`），超时语义从「总量 ≤ TIMEOUT」变成「等响应头 / 相邻 delta 静默 > TIMEOUT」，对实测 0.7 秒的流间隔极其安全；`TIMEOUT=180`（≈3.5 倍首 token 延迟余量），并把 provider 的 `max_retries` 接出为 `MAX_RETRIES=0`——HTTP 层不再静默重试，传输失败全部落进块级循环记账。生产路径实测（同块）：两次 `finish_reason=length` 截断重试后第 3 次 `stop` 通过；截断源于推理抽样波动，非流式下同样存在、只是表现为输出校验异常，重试可兜住，某本书频繁 length 截断就按日志提示调小 `INPUT_MAX_TOKENS` 或换模型。**流式日志注意点**：step_plan 每个 SSE delta 都带 usage 且被 pydantic-ai 累加，流式路径上 `chunk_result` 的输入/输出/缓存读 token 数严重虚高（实测出现 5400 万），判读以 chars / block_tags / finish_reason 为准。
+
+**2026-08-26 补充（连坐误拒 + 输出预算，均已修复）：** pydantic-ai 见到 `finish_reason=length` 会自动补发一次请求（`_agent_graph` 的 ModelRetry，Agent 默认重试 1 次），一次块级尝试因此留下多条响应；而校验与告警原先取**全部**响应的结束原因，被丢弃的截断响应会把第二条完整译文连坐否决——《DDIA》章节 23 块 1 实测 length/stop 被拒，转储里术语块齐全。已新增 `Logger.final_finish_reasons` 只看最后一次响应，校验与截断横幅都改用它。同日把 `OUTPUT_MAX_TOKENS` 提到 32768（供应商实测接受 24576/32768），从源头减少推理顶爆预算的截断。
+
+**`failed_chapters` 只增不减。** `_mark_failed` 只 append，没有任何地方在后续运行成功后把章节 ID 移出这个列表。于是 2026-08-25 那次跑收尾时打印 `失败章节 2 个: ch013, ch016`，而 ch016（章节 15）本次明明翻译成功、已经进了 `completed_chapters`。只影响收尾报告的准确性，不影响续译（`_pending_chapters` 只看 `completed_chapters`）。修复方向是在 `finalize_chapter` 成功后顺手从 `failed_chapters` 里摘掉，或者在 `_finalize_and_report` 里按 `completed_chapters` 过滤一遍。
+
+**某些内容会被供应商永久拒译。** 《Marriage and Morals》第 12 章有一块稳定触发 `status_code: 451 … censorship_blocked`，旧架构（`…20260818_114902.log`）在**同一块**上报的是同一个 451——这是供应商侧的内容过滤，不是本项目的缺陷，换模型或换供应商才有用。当前行为是这一块耗尽三次尝试、整章拒绝保存、如实报失败，这是正确的失败方式（红线 5），但白花了两次请求。
 
 **无测试。** 当前没有单元测试或集成测试，所有结论靠真实翻译跑出来的日志验证。
 
 ## 未来扩展方向
 
-### 1. 让工具错误进入重试计数
+### 1. 让目录 / 图片工具的错误进入重试计数
 
-把明显写错的参数（块号越界、章节越界）改成 `raise ModelRetry`，`max_tool_retries=3` 才会真正接管，不必等 `request_limit` 烧满。代价是要区分"模型写错"和"状态本就如此"，后者不该消耗重试。
+把明显写错的参数（条目数不符、图片名不存在）改成 `raise ModelRetry`，`max_tool_retries=3` 才会真正接管，不必等 `request_limit` 烧满。代价是要区分"模型写错"和"状态本就如此"，后者不该消耗重试。**只对目录 / 图片这两个还在用工具的阶段有意义**；章节正文已经没有工具了，那条路上的失败由 `chunk_attempts` 计数（另见「已知未解决问题」里传输错误与内容失败共用额度的那条）。
 
 ### 2. 并发翻译
 
-`concurrent_manager.py` 已提供 asyncio 并发控制和速率限制，但当前流程是串行的。章节之间除术语表外没有强依赖，接入并发的主要顾虑是术语表和进度文件的写竞争——后者已经在锁内原子写入，前者需要合并策略。
+`concurrent_manager.py` 已提供 asyncio 并发控制和速率限制，但当前流程是串行的。块级 run 之间没有 message history，天然适合并发——挡在前面的是两件事：接力包要读上一块的译文（可以退化成只带术语和风格锚点），以及 `EpubContext.chunk_translations` / `glossary` 现在没有并发写保护。进度文件那一侧已经在锁内原子写入，术语表需要合并策略。
 
-### 3. 块级续译
-
-目前缓存的最小单位是章节，一章没保存成功则整章重翻。把 `chunk_translations` 也落盘可以让重试只补缺失的块。
-
-### 4. 添加新工具
+### 3. 添加新工具
 
 ```python
 @epub_toolset.tool
@@ -421,7 +485,7 @@ def translate_metadata(ctx: RunContext[EpubContext]) -> str:
     ...
 ```
 
-### 5. 跨书籍共享术语表
+### 4. 跨书籍共享术语表
 
 当前术语表按书缓存。系列作品可以考虑全局术语表预加载。
 
@@ -429,11 +493,13 @@ def translate_metadata(ctx: RunContext[EpubContext]) -> str:
 
 | 层 | 负责 |
 |----|------|
-| **EpubTranslator** | 章节循环、切分时机、重试、写盘时机 |
-| **Agent** | 单章内的翻译与工具调度 |
+| **EpubTranslator** | 章节循环、切分时机、章级重试、写盘时机 |
+| **chunk_translator** | 块循环、接力包、块级校验与重试、块缓存 |
+| **chunk_agent**（无工具） | 一块原文 → 一块译文，纯输入输出 |
+| **epub_agent**（带工具集） | 只负责目录与图片的自主调度 |
 | **Toolsets** | 原子化的 EPUB 操作 + 保存护栏 |
-| **EpubContext** | 跨工具的共享状态 |
-| **CacheManager** | 进度持久化与断点续传 |
+| **EpubContext** | 跨 run 存活的共享状态（分块、译文、术语、尝试次数） |
+| **CacheManager** | 进度持久化、章节缓存、块缓存（内容哈希寻址） |
 | **TranslationLogger** | 失败可回溯 |
 
-划界的原则是：**凡是"错了会导致整章白翻"的决策，都放在 Python 侧**（切分、写盘、完整性判定、重试）；模型只负责它真正擅长的部分——翻译文本。
+划界的原则是：**凡是"错了会导致整章白翻"的决策，都放在 Python 侧**（切分、发放哪一块、写盘、完整性判定、重试计数）；模型只负责它真正擅长的部分——翻译文本。章节正文这条路上模型已经不做任何调度，它连自己在第几块都只是被告知而已。

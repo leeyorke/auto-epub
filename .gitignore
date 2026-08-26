@@ -166,3 +166,5 @@ cython_debug/
 
 # 诊断日志
 .epub_translation_logs/
+
+.claude/

@@ -5,6 +5,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from typing import Optional
 
 from typer import Argument, Exit, Option, Typer
 from typing_extensions import Annotated
@@ -146,17 +147,39 @@ def translate(
 
 
 @app.command()
-def clear_cache(
-    file_path: Annotated[str, Argument(help="EPUB 文件路径")],
+def clear(
+    file_path: Annotated[
+        Optional[str],
+        Argument(help="EPUB 文件路径；省略时清除全部翻译缓存"),
+    ] = None,
     target_language: Annotated[
-        str,
-        Option("-l", "--lang", help="目标语言代码"),
-    ],
+        Optional[str],
+        Option("-l", "--lang", help="目标语言代码（清除指定书籍时必填）"),
+    ] = None,
 ) -> None:
-    """清除指定文件的翻译缓存"""
+    """清除翻译缓存：指定书籍路径时清该书的缓存，省略时清空全部
+
+    示例：
+
+      # 清除指定书的缓存
+      epub-translator clear book.epub -l zh
+
+      # 清空全部翻译缓存
+      epub-translator clear
+    """
     from .cache_manager import CacheManager
 
     cache_manager = CacheManager()
+
+    if file_path is None:
+        count = cache_manager.clear_all()
+        print(f"✓ 已清除全部翻译缓存（共 {count} 本书）")
+        return
+
+    if target_language is None:
+        print("❌ 错误：指定书籍路径时必须用 -l/--lang 给出目标语言")
+        raise Exit(code=1)
+
     cache_key = cache_manager.get_cache_key(file_path, target_language)
     cache_manager.clear_cache(cache_key)
 

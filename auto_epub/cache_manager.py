@@ -11,6 +11,7 @@ from typing import Callable, Optional, Tuple
 
 from .logger import get_logger
 from .models import TranslationProgress
+from .settings import CACHE_DIR, migrate_legacy_dir
 
 
 class CacheManager:
@@ -21,9 +22,12 @@ class CacheManager:
     因此这里的读写全部走同一把锁，写入用临时文件 + os.replace 保证原子。
     """
 
-    def __init__(self, cache_dir: str = ".epub_translation_cache"):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+    def __init__(self, cache_dir=None):
+        # 默认放 ~/.auto-epub/cache；工作目录里的旧版 .epub_translation_cache
+        # 在首次运行时整体搬过去（见 settings.migrate_legacy_dir）
+        self.cache_dir = Path(cache_dir) if cache_dir else CACHE_DIR
+        migrate_legacy_dir(".epub_translation_cache", self.cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
 
     def get_cache_key(self, epub_path: str, target_lang: str) -> str:
@@ -124,7 +128,7 @@ class CacheManager:
             return None, False
         return (data, True) if isinstance(data, dict) else (None, False)
 
-    # ---------- 章节 / 图片 ----------
+    # ---------- 章节 ----------
 
     def save_chapter(self, cache_key: str, chapter_id: str, content: str) -> None:
         """保存单个章节翻译"""
@@ -144,6 +148,42 @@ class CacheManager:
         if chapter_file.exists():
             return chapter_file.read_text(encoding="utf-8")
         return None
+
+    # ---------- 分块 ----------
+    #
+    # 分块缓存按「内容哈希」寻址，而不是块号：
+    # INPUT_MAX_TOKENS 调整或原书更新导致切分变化时，哈希自然对不上 → 未命中
+    # → 重译，既不需要版本字段，也不会把旧译文错位地贴到新块上。
+    # 文件存在本身就是进度，所以块级不写进度文件（否则一章 37 次全量 JSON 重写）。
+
+    def _chunk_file(self, cache_key: str, chapter_id: str, source: str) -> Path:
+        safe_id = hashlib.md5(chapter_id.encode()).hexdigest()
+        safe_src = hashlib.md5(source.encode("utf-8")).hexdigest()
+        return self.cache_dir / cache_key / "chunks" / safe_id / f"{safe_src}.html"
+
+    def save_chunk(
+        self, cache_key: str, chapter_id: str, source: str, translated: str
+    ) -> None:
+        """保存单个分块的译文（只有通过校验的块才该调用这个）"""
+        chunk_file = self._chunk_file(cache_key, chapter_id, source)
+        try:
+            chunk_file.parent.mkdir(parents=True, exist_ok=True)
+            chunk_file.write_text(translated, encoding="utf-8")
+        except OSError as e:
+            get_logger().error(f"保存分块缓存失败: {e}")
+
+    def load_chunk(self, cache_key: str, chapter_id: str, source: str) -> Optional[str]:
+        """加载单个分块的译文，未命中返回 None"""
+        chunk_file = self._chunk_file(cache_key, chapter_id, source)
+        if not chunk_file.exists():
+            return None
+        try:
+            return chunk_file.read_text(encoding="utf-8")
+        except OSError as e:
+            get_logger().error(f"读取分块缓存失败: {e}")
+            return None
+
+    # ---------- 图片 ----------
 
     def save_image(self, cache_key: str, image_name: str, image_data: bytes) -> None:
         """保存翻译后的图片"""
@@ -167,10 +207,36 @@ class CacheManager:
         """清除指定缓存"""
         import shutil
 
-        cache_path = self.cache_dir / cache_key
-        if cache_path.exists():
-            shutil.rmtree(cache_path)
+        with self._lock:
+            cache_path = self.cache_dir / cache_key
+            if cache_path.exists():
+                shutil.rmtree(cache_path)
 
-        cache_file = self._progress_file(cache_key)
-        if cache_file.exists():
-            cache_file.unlink()
+            cache_file = self._progress_file(cache_key)
+            if cache_file.exists():
+                cache_file.unlink()
+
+    def clear_all(self) -> int:
+        """清除全部翻译缓存，返回清除的书籍条目数
+
+        缓存目录里每本书（更准确说是每个"书 + 语言"组合）占一个
+        {md5}.json 进度文件和一个 {md5}/ 内容目录，全部清掉。
+        """
+        import shutil
+
+        if not self.cache_dir.is_dir():
+            return 0
+
+        with self._lock:
+            keys: set[str] = set()
+            for entry in self.cache_dir.iterdir():
+                # 进度文件名是 {md5}.json；残留的写入临时文件后缀不是 .json，
+                # 名字长度也对不上 32 位十六进制，不会被计成一本书
+                name = entry.stem if entry.suffix == ".json" else entry.name
+                if len(name) == 32:
+                    keys.add(name)
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+            return len(keys)

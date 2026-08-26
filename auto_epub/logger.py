@@ -17,7 +17,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from .settings import LOG_DIR, LOG_EXCERPT_CHARS, LOG_TO_FILE
+from .settings import LOG_DIR, LOG_EXCERPT_CHARS, LOG_TO_FILE, migrate_legacy_dir
 
 
 class ConsoleLevel(IntEnum):
@@ -55,6 +55,9 @@ class TranslationLogger:
             return
 
         log_dir = Path(LOG_DIR)
+        # 工作目录里的旧版 .epub_translation_logs 首次运行时整体搬到
+        # ~/.auto-epub/logs（见 settings.migrate_legacy_dir）
+        migrate_legacy_dir(".epub_translation_logs", log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in book_name)
@@ -126,10 +129,87 @@ class TranslationLogger:
             ConsoleLevel.VERBOSE,
         )
 
-    def run_result(self, index: int, result: Any) -> None:
-        """记录一次 Agent run 的输出、token 用量、结束原因和工具调用序列"""
+    def chunk_result(
+        self,
+        chapter: int,
+        chunk: int,
+        total: int,
+        attempt: int,
+        stats: dict,
+        result: Any = None,
+    ) -> None:
+        """记录一块的一次尝试（红线 9 在块级路径上的落地口径）
+
+        块级 run 不用工具，所以没有"工具调用日志"可留。空转与静默失败改为靠
+        这一行发现：每块每次尝试必有一行，写不出这一行就说明代码路径漏了记账。
+
+        块与 run 一一对应，因此 finish_reason=length 现在能精确归因到具体哪一
+        块——旧的章级聚合只能告诉你"本章有 1/5 次响应被截断"，看不出是哪块。
+        """
+        ok = stats.get("ok")
+        flag = "✔" if ok else "✘"
+        parts = [f"块 {chunk + 1}/{total} 第 {attempt} 次"]
+        if stats.get("cached"):
+            parts.append("命中缓存")
+        if stats.get("passthrough"):
+            parts.append("无可译文本，原样透传")
+
+        src_chars = stats.get("src_chars")
+        out_chars = stats.get("out_chars")
+        if src_chars is not None or out_chars is not None:
+            parts.append(f"chars={src_chars}→{out_chars}")
+        src_block = stats.get("src_block_tags")
+        out_block = stats.get("out_block_tags")
+        if src_block is not None:
+            ratio = f"{out_block / src_block:.2f}" if src_block else "-"
+            parts.append(f"block_tags={out_block}/{src_block}({ratio})")
+
+        usage = self._usage(result) if result is not None else ""
+        if usage:
+            parts.append(usage)
+
+        reasons = self._finish_reasons(result) if result is not None else []
+        if reasons:
+            parts.append(f"结束原因={'/'.join(reasons)}")
+
+        reason = stats.get("reason")
+        if reason:
+            parts.append(f"原因={reason}")
+
+        line = f"章节 {chapter} {flag} " + "，".join(parts)
+        self._write("INFO" if ok else "WARN", line)
+        self.console(f"    {flag} " + "，".join(parts), ConsoleLevel.VERBOSE)
+
+        # 结构化一份，便于脚本统计"单请求输入是否与块序号无关"
+        payload = {
+            "event": "chunk_result",
+            "chapter": chapter,
+            "chunk": chunk,
+            "attempt": attempt,
+            "finish": reasons,
+            **{k: v for k, v in stats.items() if v is not None},
+        }
+        self.json_line(payload)
+
+        # 截断横幅只看最后一次响应：pydantic-ai 对 length 会自动补发一次请求
+        # （见 final_finish_reasons），被丢弃的那条不该触发横幅误导排查方向
+        if result is not None and any(
+            "length" in r for r in self.final_finish_reasons(result)
+        ):
+            # 最终输出被 max_tokens 截断：块级路径上这就是"这一块的译文写不完"，
+            # 重试同一块还会再截断，需要调小 INPUT_MAX_TOKENS
+            self._console_error(
+                f"章节 {chapter} 块 {chunk + 1} 响应被 max_tokens 截断"
+                f"（finish_reason=length），重试仍会截断则需调小 INPUT_MAX_TOKENS"
+            )
+
+    def run_result(self, stage: str, result: Any) -> None:
+        """记录一次工具型 run（目录 / 图片）的输出、token 用量、结束原因和工具调用序列
+
+        章节正文不再走这条路：块级 run 一块一行，由 chunk_result 记录。
+        """
         output = getattr(result, "output", "") or ""
-        self._write("INFO", f"章节 {index} run 结束，输出 {len(output)} 字符")
+        self._write("INFO", f"{stage} run 结束，输出 {len(output)} 字符")
         self._write("DEBUG", f"  输出内容: {self._excerpt(output)}")
 
         usage = self._usage(result)
@@ -147,12 +227,12 @@ class TranslationLogger:
             if truncated:
                 self._write(
                     "WARN",
-                    f"  章节 {index} 有 {truncated}/{len(reasons)} 次响应被 "
+                    f"  {stage} 有 {truncated}/{len(reasons)} 次响应被 "
                     f"max_tokens 截断（finish_reason=length）",
                 )
                 self.console(
-                    f"  ⚠️  章节 {index} 有 {truncated} 次模型响应被 max_tokens 截断，"
-                    f"需要调大 OUTPUT_MAX_TOKENS 或调小 INPUT_MAX_TOKENS"
+                    f"  ⚠️  {stage} 有 {truncated} 次模型响应被 max_tokens 截断，"
+                    f"需要调大 OUTPUT_MAX_TOKENS"
                 )
 
         calls = self._tool_calls(result)
@@ -163,17 +243,17 @@ class TranslationLogger:
                 ConsoleLevel.DEBUG,
             )
 
-    def leaked_tool_call(self, index: int, output: str) -> None:
+    def leaked_tool_call(self, stage: Union[int, str], output: str) -> None:
         """模型把工具调用写成了纯文本——完整落盘以便判断是否为截断所致"""
         self._write(
             "ERROR",
-            f"章节 {index} 输出了文本形式的工具调用，共 {len(output)} 字符: "
+            f"{stage} 输出了文本形式的工具调用，共 {len(output)} 字符: "
             f"{self._excerpt(output)}",
         )
         # 片段看不出结尾是否被截断，也丢掉了里面已经译好的正文，因此完整存一份
-        dumped = self._dump(index, "leaked", output, "txt")
+        dumped = self._dump(stage, "leaked", output, "txt")
         hint = f"，原始输出已存: {dumped}" if dumped else "（详见日志文件）"
-        self._console_error(f"章节 {index} 输出了文本形式的工具调用{hint}")
+        self._console_error(f"{stage} 输出了文本形式的工具调用{hint}")
 
     def error(self, message: str) -> None:
         self._write("ERROR", message)
@@ -210,6 +290,37 @@ class TranslationLogger:
         self.console(f"  ⤺ {tool}: {reason}", ConsoleLevel.VERBOSE)
 
     # ---------- 从 run 结果里挖信息 ----------
+
+    def finish_reasons(self, result: Any) -> list[str]:
+        """本次 run 里每次模型响应的结束原因（公开入口，供日志展示）"""
+        return self._finish_reasons(result)
+
+    def final_finish_reasons(self, result: Any) -> list[str]:
+        """只取最后一次模型响应的结束原因（公开入口，供校验器判截断）
+
+        pydantic-ai 见到 finish_reason=length 会自动补发一次请求
+        （_agent_graph 的 ModelRetry，Agent 默认重试 1 次），一次块级尝试
+        因此可能留下多条响应，而真正落进译文的是最后一条。前面被丢弃的
+        截断响应不能连坐否决最终译文——2026-08-26《DDIA》章节 23 块 1
+        实测过 length/stop：第二条已带术语块完整收尾，却被第一条的
+        length 误拒。截断判定必须以最后一条为准。
+        """
+        try:
+            messages = [
+                m for m in result.all_messages() if type(m).__name__ == "ModelResponse"
+            ]
+        except Exception:
+            return []
+        if not messages:
+            return []
+        message = messages[-1]
+        normalized = getattr(message, "finish_reason", None)
+        raw = (getattr(message, "provider_details", None) or {}).get("finish_reason")
+        if normalized and raw and raw != normalized:
+            return [f"{normalized}({raw})"]
+        if normalized or raw:
+            return [str(normalized or raw)]
+        return []
 
     @staticmethod
     def _usage(result: Any) -> str:
@@ -277,13 +388,21 @@ class TranslationLogger:
                     names.append(name)
         return names
 
-    def _dump(self, index: int, kind: str, text: str, suffix: str) -> Optional[Path]:
-        """把诊断内容原样落盘到日志同目录，返回文件路径（失败返回 None）"""
+    def _dump(
+        self, tag: Union[int, str], kind: str, text: str, suffix: str
+    ) -> Optional[Path]:
+        """把诊断内容原样落盘到日志同目录，返回文件路径（失败返回 None）
+
+        tag 进文件名，所以路径分隔符之类的字符一律替换掉——目录 / 图片阶段
+        传进来的是中文标签，章节路径传的是 "ch{索引}"（沿用旧文件名格式，
+        历史诊断文件仍可对照）。
+        """
         if not self.log_file:
             return None
         attempt = getattr(self, "_attempt", 0)
+        safe_tag = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(tag))
         dump = self.log_file.with_name(
-            f"{self.log_file.stem}_ch{index}_try{attempt}_{kind}.{suffix}"
+            f"{self.log_file.stem}_{safe_tag}_try{attempt}_{kind}.{suffix}"
         )
         try:
             dump.write_text(text, encoding="utf-8")
@@ -294,9 +413,20 @@ class TranslationLogger:
 
     def dump_buffer(self, index: int, translated_html: str) -> None:
         """把被拒绝的译文原样落盘，便于人工比对漏了哪一段"""
-        dump = self._dump(index, "rejected", translated_html, "html")
+        dump = self._dump(f"ch{index}", "rejected", translated_html, "html")
         if dump:
             self.console(f"  被拒译文已保存: {dump}", ConsoleLevel.DEBUG)
+
+    def dump_chunk(self, chapter: int, chunk: int, attempt: int, raw: str) -> None:
+        """把校验失败的块级模型输出原样落盘
+
+        块级 run 是纯文本输出，失败样子五花八门（markdown 围栏、前言、截断、
+        整段漏译）。片段看不出结尾是否被截断，所以完整存一份再比对。
+        文件名里的 try 是章级尝试次数，a 是这一块自己的尝试次数。
+        """
+        dump = self._dump(f"ch{chapter}", f"chunk{chunk}_a{attempt}", raw, "html")
+        if dump:
+            self.console(f"  被拒块译文已保存: {dump}", ConsoleLevel.DEBUG)
 
     def json_line(self, payload: dict) -> None:
         """结构化记录，便于脚本统计失败分布"""

@@ -90,8 +90,11 @@ python main.py translate book.epub -l zh --no-toc
 # 忽略缓存，从头重新翻译
 python main.py translate book.epub -l zh --no-resume
 
-# 清除缓存
-python main.py clear-cache book.epub -l zh
+# 清除指定书的缓存
+python main.py clear book.epub -l zh
+
+# 清空全部翻译缓存（不指定书籍路径）
+python main.py clear
 
 # 查看版本
 python main.py version
@@ -101,25 +104,35 @@ python main.py version
 
 ## 5. 运行时你会看到什么
 
+默认只打印进度：
+
 ```
-📝 诊断日志: .epub_translation_logs\book_20260811_143022.log
+📝 诊断日志: ~/.auto-epub/logs/book_20260811_143022.log
 
 [3/27] 章节 3: Chapter_2.xhtml
-    最大分块 2183 tokens，合计 6420 tokens
-  切分为 3 块
-正在翻译章节3...（剩余 2 块）
-正在翻译章节3...（剩余 1 块）
-正在翻译章节3...（剩余 0 块）
+切分为 3 块
 正在保存章节[3]...
 ```
 
-偶尔会出现保存被拒——这是正常的护栏机制，Agent 会按提示补译后重试：
+加 `-v` 会多出每块每次尝试的一行（这一行在日志文件里始终都有）：
 
 ```
-  ⤺ 章节 12 保存被拒：标签数 41/68，疑似漏译
+[3/27] 章节 3: Chapter_2.xhtml
+    最大分块 2183 tokens，合计 6420 tokens
+切分为 3 块
+    ✔ 块 1/3 第 1 次，chars=8431→3902，block_tags=22/22(1.00)，输入=3140、输出=5218、请求数=1，结束原因=stop
+    ✔ 块 2/3 第 1 次，chars=7118→3245，block_tags=19/19(1.00)，…
+    ✔ 块 3/3 第 0 次，命中缓存，chars=6205→2871，block_tags=17/17(1.00)
+正在保存章节[3]...
 ```
 
-某章连续失败超过 `MAX_CHAPTER_RETRIES` 次会被记入失败列表，该章在输出文件里保持原文，其余章节照常翻译。修完配置后重跑同一条命令，只会重译这些失败章节。
+`✘` 开头的行是这一块本次尝试没通过，会自动重译（每块最多 3 次）；`原因=` 后面写明是漏译、被截断，还是超时 / 内容审查这类 API 层异常。整章有块最终没过时会打印：
+
+```
+❌ 章节 12 第 1 次尝试未通过：还有 2/2 块没有译文（0/2 块通过校验）
+```
+
+坏块的重试额度用尽后不会再做无意义的章级重试，该章记入失败列表、在输出文件里保持原文，其余章节照常翻译。修完配置后重跑同一条命令，**已经通过校验的块不会重翻**。
 
 ## 6. 进阶配置
 
@@ -127,12 +140,17 @@ python main.py version
 
 ```python
 # 分块与输出：INPUT 必须显著小于 OUTPUT
-# 译文 + HTML 标签 + JSON 转义叠加后，输出通常是输入的 1.5~2 倍
-INPUT_MAX_TOKENS = 2500
-OUTPUT_MAX_TOKENS = 8192
+# 译文 + HTML 标签叠加后，输出通常是输入的 1.3~2 倍
+INPUT_MAX_TOKENS = 5000
+OUTPUT_MAX_TOKENS = 16384
 
-# 单章失败后的重试次数
+# 单章失败后的重试次数（只重跑没进缓存的坏块）
 MAX_CHAPTER_RETRIES = 2
+# 单块失败后的重试次数（每块共 3 次尝试，跨章级重试累计）
+MAX_CHUNK_RETRIES = 2
+
+# 块与块之间传递上下文的"接力包"token 硬上限
+CARRYOVER_MAX_TOKENS = 2000
 
 # 漏译判定：块级标签（p/div/h*/li…）比例下限，低于此判漏译
 MIN_BLOCK_TAG_RATIO = 0.8
@@ -144,12 +162,11 @@ TRANSLATE_IMAGES = True  # 默认 False
 
 # 翻译温度，越低越稳定
 TEMPERATURE = 0.1
-
-# 控制台是否打印诊断细节（不影响日志文件）
-DEBUG_MODE = True
 ```
 
-自定义翻译风格与规则：修改 `settings.py` 中的 `AGENT_SYSTEM_PROMPT`。其中的 `{target_language}` 由 `client.py` 注入，改写时要保留这个占位符。
+控制台详细程度用命令行的 `-v` / `-q` 控制，不影响日志文件（文件始终完整）。
+
+自定义翻译风格与规则：章节正文改 `settings.py` 中的 `CHUNK_SYSTEM_PROMPT`，目录与图片阶段改 `AGENT_SYSTEM_PROMPT`。两者里的 `{target_language}` 由 `client.py` 注入，改写时要保留这个占位符。
 
 ## 7. 项目结构
 
@@ -158,16 +175,17 @@ auto-epub/
 ├── auto_epub/
 │   ├── __init__.py
 │   ├── models.py              # 数据模型
-│   ├── agent_tools.py         # Agent 工具集 + EpubContext
+│   ├── agent_tools.py         # 目录/图片工具集 + EpubContext + finalize_chapter
+│   ├── chunk_translator.py    # 块级翻译核心（章节正文，无工具）
 │   ├── epub_tools.py          # EPUB 底层工具（分块、导航文档）
 │   ├── translator.py          # 翻译编排器
-│   ├── client.py              # Agent 工厂
+│   ├── client.py              # Agent 工厂（带工具 / 无工具各一个）
 │   ├── logger.py              # 诊断日志
 │   ├── cache_manager.py       # 缓存管理
 │   ├── concurrent_manager.py  # 并发控制（当前未使用）
 │   ├── cli.py                 # 命令行接口
 │   ├── config.py              # 配置加载
-│   └── settings.py            # 常量配置 + 系统提示词
+│   └── settings.py            # 常量配置 + 两份系统提示词
 ├── docs/                      # 文档
 ├── main.py                    # CLI 入口
 ├── example.py                 # 使用示例
@@ -180,35 +198,50 @@ auto-epub/
 
 ## 8. 常见问题
 
-排查任何问题的第一步都是看 `.epub_translation_logs/` 下的日志文件。
+排查任何问题的第一步都是看 `~/.auto-epub/logs/` 下的日志文件。
 
 **Q: 报错「模型输出了文本形式的工具调用」？**
 
-通常是输出被 `max_tokens` 截断，导致工具调用参数的 JSON 不完整，模型退化成把 `<tool_call>` 当普通文本吐出来。查日志里该章的分块 tokens：
+章节正文这条路上已经没有工具了，出现这个标记纯属模型自己编戏，该块会被作废重译（每块最多 3 次）。若在目录 / 图片阶段出现，通常是输出被 `max_tokens` 截断、工具调用参数的 JSON 不完整所致。
+
+**Q: 提示「块级标签 X/Y，有整段没译到」？**
+
+模型省略了部分内容，Python 会让该块重译。被拒的原始输出会完整存成 `{日志名}_ch{章号}_try{章级尝试}_chunk{块号}_a{块级尝试}.html`（块号从 0 数），可据此确认漏了哪一段、或者结尾是不是被截断了。频繁出现说明分块偏大：
 
 ```python
-INPUT_MAX_TOKENS = 2000   # 调小分块
-OUTPUT_MAX_TOKENS = 8192  # 或调大输出上限
+INPUT_MAX_TOKENS = 4000   # 调小分块
 ```
 
-**Q: 提示「保存被拒：标签数 X/Y，疑似漏译」？**
+**Q: 提示「保存被拒：还有 N 块没有译文」？**
 
-模型省略了部分内容，工具会要求它补译。日志目录下的 `*_chN_rejected.html` 是被拒的译文，可据此确认漏了哪一段。频繁出现说明分块偏大。
+有块三次尝试都没通过，整章不算完成——这是刻意的：残章不许标记完成，否则 `--resume` 会永久跳过它。看日志里那几块每次尝试的失败原因（超时、内容审查、漏译各有不同处置）。
 
 **Q: API 超时？**
 
+`TIMEOUT` 是单次 HTTP 请求的超时，而 SDK 自己还会重试两次，所以一次"块级尝试失败"的实际耗时约 3 倍。输出上万 token 的大块在 60 秒线上比较紧：
+
 ```python
 TIMEOUT = 120            # 增加超时
-INPUT_MAX_TOKENS = 1500  # 或减小分块
+INPUT_MAX_TOKENS = 4000  # 或减小分块，让单次输出变小
 ```
+
+注意超时会占用该块的重试额度（每块共 3 次），三次全超时的块会从头到尾拿不到译文。
+
+**Q: 某块稳定报 451 / censorship_blocked？**
+
+供应商侧的内容过滤，重试必然是同样结果，换模型或换供应商才有用。当前行为是这块耗尽尝试次数、整章拒绝保存并如实报失败。
 
 **Q: 翻译中断了？**
 
-直接重跑同一条命令，已完成的章节会跳过：
+直接重跑同一条命令。已完成的章节整章跳过，**没译完的章节只补没通过校验的块**（通过的块已经进了块缓存）：
 
 ```bash
 python main.py translate book.epub -l zh
 ```
+
+**Q: 调整了 `INPUT_MAX_TOKENS`，旧的块缓存会不会错位？**
+
+不会。块缓存按块原文的哈希寻址，切分一变哈希就对不上，旧缓存自动失效重译。
 
 **Q: 侧边栏目录还是原文？**
 

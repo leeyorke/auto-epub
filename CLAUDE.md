@@ -24,14 +24,17 @@ python main.py translate book.epub -l zh
 # 续译（默认开启，可显式指定）
 python main.py translate book.epub -l zh --resume
 
-# 显示诊断细节（工具调用序列、被拒译文路径等）
+# 显示诊断细节（每块每次尝试一行、被拒译文路径等）
 python main.py translate book.epub -l zh -v
 
 # 只输出错误（静默进度与摘要）
 python main.py translate book.epub -l zh -q
 
-# 清理缓存
-python main.py clear-cache book.epub -l zh
+# 清理指定书的翻译缓存
+python main.py clear book.epub -l zh
+
+# 清空全部翻译缓存（不指定书籍路径）
+python main.py clear
 
 # 运行示例脚本
 python example.py
@@ -43,7 +46,7 @@ uv run ruff format .
 
 ## 项目定位
 
-EPUB 电子书多语言翻译工具，基于 **pydantic-ai** 的 **Agent + FunctionToolset** 架构。**Python 负责流程编排与内容切分，Agent 只在"翻译一个章节"这一粒度上自主调度工具。**
+EPUB 电子书多语言翻译工具，基于 **pydantic-ai**。**章节正文的翻译是"一块原文进、一块译文出"的纯函数调用**：Python 负责流程编排、内容切分和块循环，块级 Agent 没有任何工具，模型的纯文本输出就是译文。**FunctionToolset 只剩目录与图片两个阶段在用。**
 
 **技术栈**: Python >= 3.10、pydantic-ai、ebooklib、BeautifulSoup4 + lxml、typer、tiktoken、ruff、uv
 
@@ -51,16 +54,17 @@ EPUB 电子书多语言翻译工具，基于 **pydantic-ai** 的 **Agent + Funct
 
 ```
 auto_epub/
-├── agent_tools.py   # Agent 工具集 + EpubContext + 目录/导航同步辅助
-├── translator.py    # 编排器：章节循环、重试、目录/图片阶段、收尾写盘
-├── client.py        # Agent 创建工厂（Model/Provider/Settings/Toolsets）
+├── chunk_translator.py  # 块级翻译核心：接力包、输出清理、块级校验与重试
+├── agent_tools.py   # 目录/图片工具集 + EpubContext + finalize_chapter
+├── translator.py    # 编排器：章节循环、章级重试、目录/图片阶段、收尾写盘
+├── client.py        # Agent 创建工厂（epub_agent 带工具 / chunk_agent 无工具）
 ├── epub_tools.py    # EPUB 底层操作（章节提取、递归分块、导航文档读写）
 ├── logger.py        # 诊断日志
-├── cache_manager.py # 断点续传缓存（加锁 + 原子写入）
+├── cache_manager.py # 断点续传缓存：进度 / 章节 / 块（加锁 + 原子写入）
 ├── models.py        # Pydantic 数据模型
 ├── cli.py           # Typer CLI 入口
 ├── config.py        # .env 加载
-├── settings.py      # 全局常量 + Agent 系统提示词
+├── settings.py      # 全局常量 + 两份系统提示词
 └── concurrent_manager.py  # 并发控制器（当前未被主流程使用）
 main.py / example.py     # CLI 入口 / 编程式调用示例
 ```
@@ -70,19 +74,22 @@ main.py / example.py     # CLI 入口 / 编程式调用示例
 以下每条都有"错了会导致整章甚至整本书白翻"的实测记录，**改动前先读 `docs/ARCHITECTURE.md` 的「关键设计决策与不变量」**：
 
 1. **切分只能由 Python 做**，不能暴露成 Agent 工具
-2. **分块发放必须非破坏性**：只发放"还没有译文的块"，写入靠 `chunk_index` 定位，不用队列 pop；作废重发只清译文、不动原文分块
-3. **每次 `agent.run` 必须包在 `sequential_tool_calls()` 里**：同响应内的多个同步工具会被真正并行，共享状态会互相覆盖
-4. **进度文件必须原子写入，"读—改—写"必须走 `update_progress` 留在锁内**
-5. **判定不完整的章节不许标记完成**，否则 `--resume` 会永久跳过残章
-6. **漏译只能用块级标签判定**，内联标签（`a`/`em`/`span`）模型会系统性吞掉，按全标签口径会把译完的章节误杀
-7. **保存过的章节必须让所有章节级工具闭嘴**，否则工具之间互相打脸、模型没有合法出口，会转圈到 `request_limit`
-8. **工具返回值不许承诺机制上做不到的事**：说了"请补译"就必须真能把原文发回给模型
-9. **每一次工具调用都要留一行日志**：工具的错误是 `return` 字符串而非 `raise ModelRetry`，pydantic-ai 视为成功，可以无限循环
-10. **`INPUT_MAX_TOKENS` 必须显著小于 `OUTPUT_MAX_TOKENS`**（当前 5000 / 16384）
+2. **分块发放必须非破坏性**：切分每章只做一次，写入靠 `chunk_index` 定位；重试只清"判定漏译的块"的译文，绝不重切、不动原文分块
+3. **单请求输入必须与块序号无关**：每块一次独立 `agent.run`，上下文只走常量级的接力包。让它随块号增长就会重演 37 块章节撞 400 的故障
+4. **目录 / 图片的 `agent.run` 必须包在 `sequential_tool_calls()` 里**：同响应内的多个同步工具会被真正并行，共享进度文件会互相覆盖
+5. **进度文件必须原子写入，"读—改—写"必须走 `update_progress` 留在锁内**
+6. **判定不完整的章节不许标记完成**，否则 `--resume` 会永久跳过残章；块粒度上的同一条：**只有通过 `validate_chunk` 的块才写进块缓存**
+7. **漏译只能用块级标签判定**，内联标签（`a`/`em`/`span`）模型会系统性吞掉，按全标签口径会把译完的内容误杀。也**不许做标签配平检查**——分块本来就可能是半截片段
+8. **块级与章级重试不许相乘**：`chunk_attempts` 跨章级重试累计，**绝不能在 `prepare_chapter` 里重置**
+9. **每块每次尝试都要留一行日志**（`logger.chunk_result`），包括"额度已用尽、这次不发请求"这种什么都没干的情况；否则失败在日志里是一片空白
+10. **`INPUT_MAX_TOKENS` 必须显著小于 `OUTPUT_MAX_TOKENS`**（当前 5000 / 32768）
+
+只对目录 / 图片阶段成立的两条（章节正文已随工具下线一并消失，但回退成工具型就会复活）：**工具返回值不许承诺机制上做不到的事**；**保存过的对象不能让任何入口再对它发号施令**，否则工具互相打脸、模型没有合法出口，会转圈到 `request_limit`。
 
 ## 项目特有约定
 
 - **依赖管理**: 使用 uv，镜像源为清华大学 PyPI 镜像（在 pyproject.toml 中配置）
 - **API 配置**: 通过 `.env` 文件加载，支持任意兼容 OpenAI API 格式的供应商（base_url, api_key, model）
+- **应用数据**: 缓存与日志默认在 `~/.auto-epub/`（`cache/`、`logs/`），首次运行会自动把工作目录里的旧版 `.epub_translation_cache` / `.epub_translation_logs` 整体搬过去
 - **版本**: 定义在 `auto_epub/__init__.py` 的 `__version__`
 - **无测试文件**: 当前没有单元测试或集成测试，结论靠真实翻译的诊断日志验证
