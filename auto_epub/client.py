@@ -15,6 +15,7 @@ from .settings import (
     ENABLE_CACHE,
     MAX_RETRIES,
     OUTPUT_MAX_TOKENS,
+    REASONING_EFFORT,
     TEMPERATURE,
     TIMEOUT,
 )
@@ -30,6 +31,25 @@ def _build_model() -> OpenAIChatModel:
     """
     model_provider = get_model_provider()
 
+    model_settings = OpenAIChatModelSettings(
+        temperature=TEMPERATURE,
+        # pydantic-ai 把 max_tokens 发成 max_completion_tokens
+        max_tokens=OUTPUT_MAX_TOKENS,
+        extra_body={
+            # deepseek 需要关闭思考模式；stepfun 无视这两个字段（其推理强制存在）；
+            "thinking": {"type": "disabled"},
+            # 认 enable_thinking 的供应商（Qwen 系）要布尔值，别写成字符串
+            "enable_thinking": False,
+            # 只认 max_tokens 的供应商（如 stepfun）走这条；
+            # 两个字段都发出去，谁认哪个都能生效
+            "max_tokens": OUTPUT_MAX_TOKENS,
+        },
+        timeout=TIMEOUT,
+    )
+    # None / 空串 / "none"（大小写均可）= 不发送；其余值原样传给供应商
+    if REASONING_EFFORT and REASONING_EFFORT.lower() != "none":
+        model_settings["openai_reasoning_effort"] = REASONING_EFFORT
+
     return OpenAIChatModel(
         model_provider.model,
         provider=OpenAIProvider(
@@ -43,21 +63,7 @@ def _build_model() -> OpenAIChatModel:
                 max_retries=MAX_RETRIES,
             ),
         ),
-        settings=OpenAIChatModelSettings(
-            temperature=TEMPERATURE,
-            # pydantic-ai 把 max_tokens 发成 max_completion_tokens
-            max_tokens=OUTPUT_MAX_TOKENS,
-            # 设置最低思考强度加快翻译速度
-            openai_reasoning_effort="low",
-            extra_body={
-                # deepseek需要关闭思考模式，如启用，需要回传content
-                "thinking": {"type": "disabled"},
-                # 只认 max_tokens 的供应商（如 stepfun）走这条；
-                # 两个字段都发出去，谁认哪个都能生效
-                "max_tokens": OUTPUT_MAX_TOKENS,
-            },
-            timeout=TIMEOUT,
-        ),
+        settings=model_settings,
     )
 
 

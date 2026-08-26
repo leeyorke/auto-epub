@@ -84,3 +84,27 @@
 - 流式路径 chunk_result 的输入 / 输出 / 缓存读 token 数严重虚高：step_plan 每个 SSE
   delta 都携带一份 usage 且被 pydantic-ai 逐条累加（实测出现 5400 万）。判读以 chars /
   block_tags / finish_reason 为准；成本核算待修（取最后一个 usage 事件或用 tiktoken 本地估算）。
+
+## 2026-08-26 · step_plan「推理跑飞」定性与流式回切
+
+### 背景
+
+《When Money Destroys Nations》章节 14 连续失败，日志只见 `UnexpectedModelBehavior: Exceeded maximum retries (1) for output validation` 与「chars=21283→0」，真实响应形态不可见。用原始 chat/completions 探针 + httpx 抓包逐变量隔离后定性：这块内容让模型的隐藏推理以高概率膨胀到 9~11 万字符、烧光 32768 输出预算且正文为零；12 次实测仅 1 次收敛。顺带证实 pydantic-ai 对 `openai_reasoning_effort` 的映射与 profile 剔除均无误（抓包见请求体原样携带），问题出在 step_plan 供应商侧：思考强制开启、max_tokens 连思维链一起限长。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| settings.py | 新增 `REASONING_EFFORT`（None/空串/"none" 不发送，当前 "low"）；新增 `STREAMING=False` 回切非流式；TIMEOUT 180→360（非流式总量口径下给慢收敛样本留两倍余量） |
+| client.py | `model_settings` 改具名构造后按条件注入 `openai_reasoning_effort`；`enable_thinking` 修正为布尔 False（字符串对认字段的供应商等于没关）；注释同步今日证据 |
+| chunk_translator.py | `translate_one_chunk` 按 `STREAMING` 分支：True 走原 `run_stream` 保活收全文，False 走 `agent.run`（两者共用同一套校验 / 记账 / 缓存） |
+| 文档 | docs/ARCHITECTURE.md 同步块级翻译描述、预算推导数字、参数直通结论，并在已知问题新增「推理跑飞」定性条目 |
+
+### 实测证据（章节 14 块 1，21283 字符，step-3.7-flash）
+
+- 非流式干净参数：1/3 收敛（141 秒 stop、9043 字符），其余推理 9~11 万字符烧满 32768。
+- 流式（生产路径）：3 次尝试全灭，每次内部两次请求均空。
+- `reasoning_effort=low` ×3：推理 9.3~9.5 万字符，全部烧满——文档承诺的低档省 Token 在病态内容上不存在。
+- `enable_thinking=False`、极简提示词：均无效。
+- 抓包：请求体原样携带 `reasoning_effort`/`max_completion_tokens`/extra_body 合并字段，映射链路正确。
+

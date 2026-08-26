@@ -107,11 +107,11 @@
 
 ### 2. 块级翻译（chunk_translator.py）
 
-每块一次独立流式 `agent.run_stream`（TIMEOUT 按「等响应头 / 相邻 delta 沉默」计，见「已知未解决问题」），**run 与 run 之间没有 message history**，所以单请求输入与块序号无关：
+每块一次独立 `agent.run`（`settings.STREAMING=False` 默认走非流式；置 True 时改用 `run_stream` 流式收全文，超时按「等响应头 / 相邻 delta 沉默」计），**run 与 run 之间没有 message history**，所以单请求输入与块序号无关：
 
 ```
 Python: 取第 i 块原文 + 拼接接力包
-   → chunk_agent.run_stream(prompt)  # 无工具、无 deps、无历史；流式收全文再校验
+   → chunk_agent.run(prompt)         # 无工具、无 deps、无历史；非流式收全文再校验
    → clean_model_html（剥围栏/前言）
    → split_terms_block（摘掉末尾术语块）
    → validate_chunk（块级标签比例 / 截断 / 工具调用泄漏）
@@ -210,9 +210,9 @@ Python 按 `pending_chunks()` 决定发哪块，写入靠 `chunk_index` 定位�
 早期版本只遍历 `body.children`，而 calibre 导出的 EPUB 常把整章包在一个 `<section>` 里——于是"切分"后整章仍是一个 2.5 万 token 的块。这个块喂给模型后，输出被 `max_tokens` 截断 → 工具调用参数的 JSON 不完整 → 模型退化成把 `<tool_call>` 当普通文本吐出来，控制台上只显示一行"模型输出了文本形式的工具调用"，根因完全看不出来。
 所有分块拼接后与原 body 内容完全一致，这是分块器的正确性约束。
 
-**`INPUT_MAX_TOKENS` 必须显著小于 `OUTPUT_MAX_TOKENS`。当前取值 `5000 / 16384`。**
+**`INPUT_MAX_TOKENS` 必须显著小于 `OUTPUT_MAX_TOKENS`。当前取值 `5000 / 32768`。**
 译文 + 完整 HTML 标签 + JSON 字符串转义叠加后输出会放大：拿现有缓存和日志里配对的 500 组"发放/写入"实测，输出/输入 token 比中位 1.32、p90 1.68、p99 1.87、最大 1.99（其中 JSON 转义只占 +1%，主要来自中文 token 密度）。此外推理 token 也计入 `max_tokens` 却不出现在 `result.output` 里，因此"输出看着不长"并不代表没被截断。
-按最坏比例 2.0 算：`5000 × 2 + 6000(推理) ≈ 16000 < 16384`，即使供应商不认 `reasoning_effort=low`、推理照旧吃掉 6000 token 也留有余量。这里的 6000 是留给推理的预留额度，不是观测值——stepfun 至今没在 `usage.details` 里报过 `reasoning_tokens`（现有日志里 details 只出现过 `cached_tokens`），推理到底吃了多少无法从日志验证，能直接观测的只有 `finish_reason`。
+按最坏比例 2.0 算：`5000 × 2 + 12000(推理) ≈ 22000 < 32768`。12000 是成功翻译样本里见过的最大推理规模（约 3 万字符）再留余量——stepfun 至今没在 `usage.details` 里报过 `reasoning_tokens`（details 只出现过 `cached_tokens`），推理规模只能从 `reasoning_content` 字符数间接观测。注意这只覆盖正常收敛的样本：2026-08-26 还定性了同一块内容推理膨胀到 10 万字符、把整个输出预算烧光的「推理跑飞」形态，那属于供应商侧行为，预算公式救不了（见「已知未解决问题」）。
 调大 `INPUT_MAX_TOKENS` 能成倍减少分块数，进而线性降低整章的累计输入 token，但**单请求峰值上下文不变**；代价是一旦某块译文超预算被截断，重试同一块还会再次超出，整章会耗尽重试次数。
 （拆成块级 run 之前，累计输入是块数的**平方**级——每次请求都要重发已累积的对话。那个平方项连同 message history 一起消失了，见下节。）
 
@@ -324,7 +324,7 @@ pydantic-ai 在 `_agent_graph.py` 里对一个响应内的多个 tool call 走 `
 系统提示词放在 settings.py 而非单独文件，便于直接修改翻译规则和风格。其中的 `{target_language}` 在 client.py 中通过 `str.format()` 注入。
 
 **模型侧参数走 `OpenAIChatModelSettings`。**
-`openai_reasoning_effort` 会被 pydantic-ai 直通成请求里的 `reasoning_effort`（`models/openai.py` 无模型名门槛），用它把推理强度压到 `low`，给译文腾出 `max_tokens` 预算。
+`openai_reasoning_effort` 会被 pydantic-ai 直通成请求里的 `reasoning_effort`——2026-08-26 用 httpx event_hooks 抓包实证：`models/openai.py:659` 的参数映射原样透传，profile 的剔除名单只针对 o 系/gpt-5 的 temperature 等，碰不到它。step_plan 的思考模式**无法关闭**（官方文档只有 low/medium/high 三档强度，实测任何写法都不影响推理照跑），因此 `settings.REASONING_EFFORT` 只控制「发不发、发哪档」：None/空串/"none" 不发送，当前取 low——对正常内容能省推理时间，但对「推理跑飞」的病态块无效（实测 low 档照样膨胀到 9 万字符，见已知问题）。
 **输出上限同时发两遍**：`max_tokens=OUTPUT_MAX_TOKENS` 被 pydantic-ai 发成 `max_completion_tokens`，而 stepfun 这类只认 `max_tokens` 的供应商靠 `extra_body={"max_tokens": OUTPUT_MAX_TOKENS}` 兜住（`extra_body` 在 `models/openai.py:674` 直接合并进请求体）。两个字段值相同、谁认哪个都生效，避免供应商命名差异把上限静默丢掉。
 
 **关于 `finish_reason=length` 的正确读法**（推翻了早期结论）：早期文档写"日志里仍出现 `length` 就说明两个字段都没被认"，这是反的——`length` 恰恰是**有上限在生效**的证据，只是无法从 finish_reason 区分截断发生在我们发的 16384 还是供应商自己的默认值。
@@ -463,6 +463,11 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 **`failed_chapters` 只增不减。** `_mark_failed` 只 append，没有任何地方在后续运行成功后把章节 ID 移出这个列表。于是 2026-08-25 那次跑收尾时打印 `失败章节 2 个: ch013, ch016`，而 ch016（章节 15）本次明明翻译成功、已经进了 `completed_chapters`。只影响收尾报告的准确性，不影响续译（`_pending_chapters` 只看 `completed_chapters`）。修复方向是在 `finalize_chapter` 成功后顺手从 `failed_chapters` 里摘掉，或者在 `_finalize_and_report` 里按 `completed_chapters` 过滤一遍。
 
 **某些内容会被供应商永久拒译。** 《Marriage and Morals》第 12 章有一块稳定触发 `status_code: 451 … censorship_blocked`，旧架构（`…20260818_114902.log`）在**同一块**上报的是同一个 451——这是供应商侧的内容过滤，不是本项目的缺陷，换模型或换供应商才有用。当前行为是这一块耗尽三次尝试、整章拒绝保存、如实报失败，这是正确的失败方式（红线 5），但白花了两次请求。
+
+**step_plan「推理跑飞」（2026-08-26 定性）。** 《When Money Destroys Nations》章节 14 块 1（21283 字符）会让 step-3.7-flash 以高概率陷入隐藏推理死循环：`reasoning_content` 膨胀到 9~11 万字符、把 32768 输出预算整个烧光、正文 0 字符、`finish_reason=length`；pydantic-ai 对 length 自动补发一次后仍然全空，对外抛 `UnexpectedModelBehavior: Exceeded maximum retries (1) for output validation`。
+同日 12 次受控实测（同提示词、近同参数）仅 1 次自然收敛（141 秒 stop、译文 9043 字符、推理约 3 万字符），其余全部跑飞；流式比非流式更糟（5/5 全灭），`reasoning_effort=low`、`enable_thinking=False`、极简强指令提示词全都拦不住。
+根因在供应商：step_plan 强制开启思考，且 `max_tokens` 把思维链和回答一起限长（对照：阿里云百炼托管的同名模型默认关闭思考、思维链不计入 max_tokens，但那是另一个需要单独开通的端点）；本机 httpx 抓包证明 pydantic-ai 参数传输无误，锅不在客户端。
+**已实施的缓解**：`settings.STREAMING=False` 回切非流式（收敛概率相对更高的路径）、`TIMEOUT=360` 给慢收敛样本留余量、`REASONING_EFFORT=low` 压正常内容的推理开销。**遗留**：病态块没有软件侧解法，重试等于抽签；日志特征是「chars=N→0 + finish=length + UnexpectedModelBehavior」，某本书频繁出现就直接换供应商，别再烧额度。
 
 **无测试。** 当前没有单元测试或集成测试，所有结论靠真实翻译跑出来的日志验证。
 

@@ -31,13 +31,12 @@ def migrate_legacy_dir(legacy_name: str, target: Path) -> None:
 
 
 # API 设置
-# 单次 HTTP 读操作的超时（等响应头 + 相邻流 delta 的最长沉默）。2026-08-25 起
-# 块级翻译走流式（chunk_translator.translate_one_chunk），它不再是"整次请求的
-# 总预算"：首个 token 之前的隐藏推理（夜间实测首 delta 要 51.3 秒）和慢速长流
-# 都不会误杀，总时长不受限。取值 ≈3.5 倍于实测首 token 延迟、远大于实测流内
-# 最大间隔 0.7 秒。注意 OpenAI SDK 默认还会在幕后重试两次（已由 MAX_RETRIES
-# 显式关掉），否则一次失败的实际墙钟成本是 3 × TIMEOUT。
-TIMEOUT = 180
+# 单次请求的超时。口径随 STREAMING 走：True 时是「等响应头 / 相邻 delta 的
+# 最长沉默」，总时长不受限；False（当前默认）时是「整次请求的总预算」。
+# 2026-08-26 定为 360：章节14块1 非流式实测耗时 141~200+ 秒（推理重、采样
+# 波动大），180 的线三次全部误杀，360 约为实测最长正常请求的两倍；真正
+# 死掉的请求最多烧 360 秒就记一行失败（MAX_RETRIES=0，无幕后放大）。
+TIMEOUT = 360
 # OpenAI SDK 层的静默重试次数，经 client.py 接到 AsyncOpenAI(max_retries=...)。
 # 必须显式置 0：SDK 默认 2 次，会把一次失败悄悄放大成 3 × TIMEOUT 的墙钟
 # （2026-08-25 实测"183 秒一条失败日志"的根源），且日志只记一笔、看不到内部
@@ -60,6 +59,16 @@ OUTPUT_MAX_TOKENS = 32768  # 足够容纳大章节的翻译内容+JSON转义开�
 # 整章会耗尽重试次数。改这个值必须同时重算 OUTPUT_MAX_TOKENS。
 INPUT_MAX_TOKENS = 5000
 TEMPERATURE = 0.1
+# 经测试，step_plan上这家三个模型都不支持关闭思考，只能降低推理强度，加快翻译
+REASONING_EFFORT = "low"
+# 块级翻译是否走流式。2026-08-26 在 stepfun 实测（章节14块1，同一提示词）：
+# 非流式 141 秒 stop 正常完成；流式无论发不发 reasoning_effort /
+# enable_thinking，都是推理烧满 32768 输出预算、正文 0 字符（生产路径连续
+# 3 次尝试全灭）。流式当初是为绕开「非流式总预算被旧 60 秒超时整批误杀」
+# 引入的——现在 TIMEOUT=360 覆盖实测最长正常请求（200+ 秒），HTTP 层静默
+# 重试也已关（MAX_RETRIES=0），非流式的总量口径重新安全且行为可预期。
+# 换供应商后若首 token 常态超过 TIMEOUT 再改回 True。
+STREAMING = False
 MAX_REQUESTS = 128  # 目录 / 图片 run 的最大 API 请求数（块级 run 无工具，见下）
 MAX_CHAPTER_RETRIES = 2  # 单章翻译失败后的重试次数（只重跑没进缓存的坏块）
 # 单块翻译失败后的重试次数（每块共 3 次尝试）。

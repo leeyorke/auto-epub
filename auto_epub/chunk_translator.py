@@ -54,6 +54,7 @@ from .settings import (
     MAX_CHUNK_RETRIES,
     MIN_BLOCK_TAG_RATIO,
     MIN_INLINE_TAG_RATIO,
+    STREAMING,
     TERMS_BLOCK_BEGIN,
     TERMS_BLOCK_END,
 )
@@ -427,18 +428,26 @@ async def translate_one_chunk(
         )
 
         try:
-            # 流式收全文：超时语义是「等响应头 / 相邻 delta 的沉默 > TIMEOUT」，
-            # 不是整请求总量。step-3.5-flash 出第一个字之前要做完隐藏推理
-            # （2026-08-25 夜间实测首 delta 51.3 秒、总耗时 62~68 秒），非流式的
-            # 总量口径被旧 60 秒线整批误杀；流式下只要 token 还在滴就不算挂。
-            # delta 逐个消费只为保活，全文以 get_output 为准。
-            async with agent.run_stream(
-                prompt, usage_limits=UsageLimits(request_limit=2)
-            ) as streamed:
-                async for _delta in streamed.stream_text(delta=True):
-                    pass
-                raw = (await streamed.get_output()) or ""
-                result = streamed
+            # 流式 vs 非流式的取舍见 settings.STREAMING 注释：step_plan 上流式
+            # 更易诱发推理跑飞（同块内容非流式尚有收敛样本、流式五次全部
+            # 烧满预算零正文），当前默认非流式——TIMEOUT=360 的总量口径覆盖
+            # 实测最长正常请求（200+ 秒）。
+            if STREAMING:
+                # 流式的超时语义是「等响应头 / 相邻 delta 的沉默 > TIMEOUT」，
+                # 不是整请求总量；delta 逐个消费只为保活，全文以 get_output 为准。
+                async with agent.run_stream(
+                    prompt, usage_limits=UsageLimits(request_limit=2)
+                ) as streamed:
+                    async for _delta in streamed.stream_text(delta=True):
+                        pass
+                    raw = (await streamed.get_output()) or ""
+                    result = streamed
+            else:
+                run_result = await agent.run(
+                    prompt, usage_limits=UsageLimits(request_limit=2)
+                )
+                raw = run_result.output
+                result = run_result
         except Exception as e:
             logger.chunk_result(
                 chapter_index,

@@ -37,7 +37,7 @@
 ### chunk_translator.py vs agent_tools.py
 
 **chunk_translator.py（章节正文，无工具）**
-- 一块原文 → 一次流式 `chunk_agent.run_stream` → 一块译文，模型没有任何工具可调
+- 一块原文 → 一次 `chunk_agent.run`（`settings.STREAMING=True` 时为 `run_stream` 流式）→ 一块译文，模型没有任何工具可调
 - 上下文靠接力包拼进 prompt，不靠 message history（单请求输入与块序号无关）
 - 块级校验、块级重试计数、块缓存读写都在这里
 
@@ -59,7 +59,7 @@
 ```
 EpubTranslator（章节循环）
   ├─ chunk_translator.py（块循环）
-  │    ↓ chunk_agent.run_stream()，无工具
+  │    ↓ chunk_agent.run()（STREAMING=False 默认；True 时 run_stream），无工具
   │  agent_tools.py 的非工具部分（finalize_chapter、_count_tags、merge_glossary）
   │
   └─ 目录 / 图片各一次 agent.run(deps=EpubContext)
@@ -87,7 +87,7 @@ translate_chapter_chunks(chunk_agent, ctx, n, total)  (chunk_translator.py)
        ├─ cache_manager.load_chunk(key, chapter_id, 块原文)   # 命中就不发 API
        ├─ has_translatable_text() 为假 → 原样透传，也不发 API
        ├─ build_chunk_prompt = 原文 + build_carryover（接缝 / 术语 / 风格锚点，≤2000 tokens）
-       ├─ chunk_agent.run_stream(prompt)   # 无工具、无 deps、无 history；流式收全文
+       ├─ chunk_agent.run(prompt)   # 无工具、无 deps、无 history；非流式收全文
        ├─ clean_model_html → split_terms_block → parse_terms_block
        ├─ validate_chunk（块级标签比例、工具调用泄漏、finish_reason=length）
        │    ├─ 通过 → 写 chunk_translations[n][i] + save_chunk 落缓存 + merge_glossary
