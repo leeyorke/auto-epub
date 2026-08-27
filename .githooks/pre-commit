@@ -1,0 +1,27 @@
+#!/bin/sh
+# pre-commit 钩子：单元测试全绿才允许提交。
+#
+# 启用方式（每个克隆执行一次）：
+#   git config core.hooksPath .githooks
+#
+# 失败即阻断提交（pytest 退出码非 0 时脚本以同一退出码结束）。
+# 测试套件不发 API、不落盘，全程约 2 秒。
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 1
+
+# 解析 Python：优先项目 venv（系统 Python 版本可能不满足 requires-python）
+PY="$ROOT/.venv/Scripts/python"   # Windows
+if [ ! -x "$PY" ]; then
+    PY="$ROOT/.venv/bin/python"   # Linux / macOS
+fi
+if [ ! -x "$PY" ]; then
+    PY=python
+fi
+
+echo "[pre-commit] 运行单元测试（$PY -m pytest）..."
+"$PY" -m pytest -q || {
+    echo ""
+    echo "[pre-commit] ❌ 单元测试未全部通过，提交已被阻止。"
+    echo "[pre-commit]    本地跑一遍查看详情：$PY -m pytest"
+    exit 1
+}

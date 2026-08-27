@@ -17,3 +17,10 @@ default = true
 
 [tool.uv.pip]
 index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

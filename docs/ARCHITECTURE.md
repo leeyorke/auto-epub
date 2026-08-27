@@ -471,7 +471,31 @@ client.py 中显式设置 `extra_body={"thinking": {"type": "disabled"}}`，兼�
 根因在供应商：step_plan 强制开启思考，且 `max_tokens` 把思维链和回答一起限长（对照：阿里云百炼托管的同名模型默认关闭思考、思维链不计入 max_tokens，但那是另一个需要单独开通的端点）；本机 httpx 抓包证明 pydantic-ai 参数传输无误，锅不在客户端。
 **已实施的缓解**：`settings.STREAMING=False` 回切非流式（收敛概率相对更高的路径）、`TIMEOUT=360` 给慢收敛样本留余量、`REASONING_EFFORT=low` 压正常内容的推理开销。**遗留**：病态块没有软件侧解法，重试等于抽签；日志特征是「chars=N→0 + finish=length + UnexpectedModelBehavior」，某本书频繁出现就直接换供应商，别再烧额度。
 
-**无测试。** 当前没有单元测试或集成测试，所有结论靠真实翻译跑出来的日志验证。
+**~~无测试~~（2026-08-27 起已有单元测试）。** `tests/` 下建立了单元测试套件（`python -m pytest` 运行），历史结论仍以真实翻译的诊断日志为准；套件的布局与红线覆盖关系见下方「单元测试」一节。
+
+## 单元测试
+
+**运行方式与边界：** `python -m pytest`（配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`）。套件**不发 API、不写真实缓存目录**：cache/log 一律 Mock 或 None，EPUB 对象在内存里构造；涉及临时目录的少数用例因沙箱权限受限标注 skip，其余全部纯内存执行。
+
+| 文件 | 覆盖 |
+|------|------|
+| `tests/test_models.py` | 四个 Pydantic 模型的默认值、序列化往返 |
+| `tests/test_settings.py` | 红线 10（INPUT/OUTPUT_MAX_TOKENS）、重试常量、标签比例阈值、提示词占位符、`migrate_legacy_dir` 边界规则 |
+| `tests/test_config.py` | `_ModelProvider` 与 `.env` 加载入口 |
+| `tests/test_cache_manager.py` | `_decode` 尾部残留容忍（进程内缓存撕裂修复口径）；文件型用例待沙箱放开后补齐 |
+| `tests/test_logger.py` | ConsoleLevel 分级、chunk_result 结构化 JSON 行、finish_reason 只看最后一条响应、usage/details 提取、每次工具调用一行 |
+| `tests/test_epub_tools.py` | 语言元数据读写、章节/导航文档按内容识别（page-list / landmarks 不参与翻译）、xml 解析器保留 `<head>`、**分块器拼接恒等**（所有块拼回等于原 body 内容）、单 `<section>` 包裹整章时下钻切开 |
+| `tests/test_chunk_translator.py` | clean_model_html 剥围栏/前言、边界标记不以 `<` 开头的原因、术语块摘除与幻觉键核对、接力包优先级（接缝 > 术语 > 风格锚点）与硬上限砍断、validate_chunk 全分支（配平不做检查、内联只告警、img 计块级）、缓存命中 / 无文本透传 / 额度用尽三条零 API 分支（红线 6、8、9） |
+| `tests/test_agent_tools.py` | 标签计数两口径一致性、目录 collect↔apply 严格同序、EpubContext 状态机（乱序写入按块号还原、thin_chunks 只看块级、`prepare_chapter` **不重置 attempts**）、merge_glossary 先到先得并走 update_progress、finalize_chapter 保存闸门（有 pending 块拒绝且不写进度、判定不完整照写 book 但不进 completed） |
+| `tests/test_translator.py` | 待译章节过滤（匹配键是 `get_id()`）、输出路径生成、失败章节幂等标记、缓存恢复与"缺失即踢回重译"、chunk_agent 惰性创建只建一次 |
+| `tests/test_client.py` | 两个 Agent 工厂的系统提示词占位符替换、**工具集清点**：目录/图片工具齐全且章节级工具没有复活 |
+| `tests/test_cli.py` | `-q` 与 `-v` 互斥、扩展名校验顺序、clear 缺 `-l` 报错、version 输出 |
+| `tests/test_concurrent_manager.py` | 未投入主流程的并发控制器公共行为：结果保序、单任务异常被捕获不炸整批、max_workers 串行上限 |
+
+**写新测试的约定：** 行为断言经由公共接口（同 TDD 原则），不断言私有实现细节；凡属上面红线表里的不变量，改动时必须有对应测试先红后绿。
+
+**提交闸门：`git commit` 必须先过全套单元测试（2026-08-27）。**
+钩子脚本随仓库版本化在 `.githooks/pre-commit`，用 `git config core.hooksPath .githooks` 启用——git 出于安全从不执行仓库目录里的钩子，`core.hooksPath` 又只存在本机 `.git/config`，所以这步要在每个克隆手动做一次（命令见 CLAUDE.md）。钩子优先用项目 venv 的 Python（`.venv/Scripts/python` → `.venv/bin/python` → PATH 里的 `python` 依次回退，系统 Python 可能不满足 requires-python >= 3.10）跑 `pytest -q`，退出码非 0 即拒绝提交。两条路径均已在真实提交上验证：全绿放行、模拟失败阻断且 HEAD 不动。绕过方式 `--no-verify` 留给明确知情的场景；套件约 2 秒，日常没有绕过的理由。
 
 ## 未来扩展方向
 

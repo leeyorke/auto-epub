@@ -39,6 +39,14 @@ python main.py clear
 # 运行示例脚本
 python example.py
 
+# 运行单元测试（套件不联网、不写真实缓存目录）
+python -m pytest
+# 只跑某一个模块的测试 / 带详细输出
+python -m pytest tests/test_chunk_translator.py -v
+
+# 启用提交前测试闸门（每个克隆执行一次；core.hooksPath 不随仓库分发）
+git config core.hooksPath .githooks
+
 # 代码检查与格式化
 uv run ruff check .
 uv run ruff format .
@@ -92,4 +100,4 @@ main.py / example.py     # CLI 入口 / 编程式调用示例
 - **API 配置**: 通过 `.env` 文件加载，支持任意兼容 OpenAI API 格式的供应商（base_url, api_key, model）
 - **应用数据**: 缓存与日志默认在 `~/.auto-epub/`（`cache/`、`logs/`），首次运行会自动把工作目录里的旧版 `.epub_translation_cache` / `.epub_translation_logs` 整体搬过去
 - **版本**: 定义在 `auto_epub/__init__.py` 的 `__version__`
-- **无测试文件**: 当前没有单元测试或集成测试，结论靠真实翻译的诊断日志验证
+- **测试**: 单元测试在 `tests/`，`python -m pytest` 即可运行；**不发 API、不落盘**——cache/log 一律 Mock 或 None，EPUB 对象在内存里构造。布局与红线覆盖关系见 `docs/ARCHITECTURE.md`「单元测试」一节
